@@ -1,10 +1,10 @@
 # WS02 STATUS (2026-09-14T03:15:00+08:00)
 
 state: done
-current: v0 完工合同（SPEC §8）达成：308 个离线确定性测试全绿（5.0s）、demo 字节复现、benchmark JSON 通过 §6 校验、mypy strict/ruff 干净。Gauntlet 全量复测仅剩 1 条失败（`test_gp_case_folding_does_not_unlock_git_metadata`），且该用例代码自相矛盾（详见 FIND-011 行），非产品缺陷。
+current: v0 完工合同（SPEC §8）达成：308 个离线确定性测试全绿（4.75s）、demo 字节复现、benchmark JSON 通过 §6 校验、mypy strict/ruff 干净。Gauntlet 全量复测 1 条失败（`test_gp_case_folding_does_not_unlock_git_metadata`，用例自相矛盾）；AC-05 repro 11/13（余 2 条均为用例侧问题：`test_p1_3_*` 用例笔误、`test_p2_4_*` 与 Gauntlet G-A 夹具互斥），详见「4b. 验收套件之间的冲突」。
 
 progress:
-- 2026-09-14 Step 4+5 完成：`examples/end_to_end.py`（确定性 clock/id/无 sleep）→ `benchmarks/self_hosting_sim.json` 字节复现；`docs/report_schema.json`、`scripts/validate_benchmark.py`、`scripts/reproduce_all.sh`；`docs/ARCHITECTURE.md`、DEC-013…DEC-021。（commit 50ae56d 及后续）
+- 2026-09-14 Step 4+5 完成：`examples/end_to_end.py`（确定性 clock/id/无 sleep）→ `benchmarks/self_hosting_sim.json` 字节复现；`docs/report_schema.json`、`scripts/validate_benchmark.py`、`scripts/reproduce_all.sh`；`docs/ARCHITECTURE.md`、DEC-013…DEC-021。（commits 50ae56d、0c571da、48f72e1、7abce9f）
 - 2026-09-14 AC-05 修复：P0-B `_wait_any` 不再对已取消 future 调 `.exception()`（SIGINT 可落盘 RUN_FINISHED）；P1-C poison 仅在 attempts 耗尽后生效；挂死调用有 liveness backstop；并发 split 插入时复核上界；TASK_CREATED 出生白名单；rework artifact 幂等；cancel_request 迁至 control 表并在 run 前请求也生效。（commit a9fe830 / 50ae56d）
 - 2026-09-14 RedTeam FIND-001…014：resume 强制重派 RUNNING+REVIEW（P0）、失败尝试记账（含 `billed N tokens` 兜底）、路径大小写折叠与硬链接别名处理、恢复 API 租约感知+并发单胜者、event_id 幂等、per-run 连续 seq、孤儿默认拒绝、`add()` 清理旧边、Retry-After 不被 max_delay 截断；附 40 条回归 + 真实 SIGKILL 子进程测试。（commit 2b28757）
 - 2026-09-14 Step 3：`tests/` 289 条（≥150），含 64 线程 claim 竞争、SIGKILL→resume、预算四维硬停、死锁、失控分解 5s 终止、取消、重试风暴、supervisor 不误报/不放过、事件重放一致性、路径越界；C1–C17 各正/反向用例矩阵。
@@ -55,7 +55,7 @@ next:
 
 ### 2. 测试与静态检查（原始结论）
 
-- `uv run pytest` → `308 passed in 4.97s`（含 `-m slow` 的 SIGKILL 子进程用例；全程离线、无 API key）
+- `uv run pytest` → `308 passed in 4.75s`（含 `-m slow` 的 SIGKILL 子进程用例；全程离线、无 API key）
 - `uv run mypy src/agentcorp` → `Success: no issues found in 33 source files`
 - `uv run ruff check` → `All checks passed!`
 - demo 复现：连续两次 `uv run python examples/end_to_end.py --quiet` 输出 JSON `diff` 无差异
