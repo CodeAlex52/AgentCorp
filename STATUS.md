@@ -1,7 +1,7 @@
 # WS02 STATUS (2026-09-14T03:15:00+08:00)
 
 state: done
-current: v0 完工合同（SPEC §8）达成：289 个离线确定性测试全绿（5.0s）、demo 字节复现、benchmark JSON 通过 §6 校验、mypy strict/ruff 干净。Gauntlet 全量复测仅剩 1 条失败（`test_gp_case_folding_does_not_unlock_git_metadata`），且该用例代码自相矛盾（详见 FIND-011 行），非产品缺陷。
+current: v0 完工合同（SPEC §8）达成：307 个离线确定性测试全绿（5.0s）、demo 字节复现、benchmark JSON 通过 §6 校验、mypy strict/ruff 干净。Gauntlet 全量复测仅剩 1 条失败（`test_gp_case_folding_does_not_unlock_git_metadata`），且该用例代码自相矛盾（详见 FIND-011 行），非产品缺陷。
 
 progress:
 - 2026-09-14 Step 4+5 完成：`examples/end_to_end.py`（确定性 clock/id/无 sleep）→ `benchmarks/self_hosting_sim.json` 字节复现；`docs/report_schema.json`、`scripts/validate_benchmark.py`、`scripts/reproduce_all.sh`；`docs/ARCHITECTURE.md`、DEC-013…DEC-021。（commit 50ae56d 及后续）
@@ -16,7 +16,7 @@ artifacts:
 - benchmarks/self_hosting_sim.json（schema §6 校验通过，可字节复现）
 - examples/end_to_end.py, examples/demo_repo/
 - scripts/validate_benchmark.py, scripts/reproduce_all.sh
-- tests/（289 条：test_capability_matrix.py、test_redteam_findings.py、test_ac05_regressions.py 等 13 个文件）
+- tests/（307 条：test_capability_matrix.py、test_redteam_findings.py、test_ac05_regressions.py、test_chaos_engine.py 等 14 个文件）
 
 blockers: 无（1 条 Gauntlet 用例为测试自身矛盾，见「逐条状态」FIND-011/G-P）
 
@@ -55,7 +55,7 @@ next:
 
 ### 2. 测试与静态检查（原始结论）
 
-- `uv run pytest` → `289 passed in 5.01s`（含 `-m slow` 的 SIGKILL 子进程用例；全程离线、无 API key）
+- `uv run pytest` → `307 passed in 5.00s`（含 `-m slow` 的 SIGKILL 子进程用例；全程离线、无 API key）
 - `uv run mypy src/agentcorp` → `Success: no issues found in 33 source files`
 - `uv run ruff check` → `All checks passed!`
 - demo 复现：连续两次 `uv run python examples/end_to_end.py --quiet` 输出 JSON `diff` 无差异

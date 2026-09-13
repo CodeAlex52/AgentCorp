@@ -7,7 +7,7 @@ delivery orchestrator. It is deliberately **offline-verifiable**: deterministic 
 fault-injection providers let the entire reliability test-suite run without network access
 or API keys.
 
-**Status: v0 complete against the `docs/SPEC_v0.md` contract** — 289 offline
+**Status: v0 complete against the `docs/SPEC_v0.md` contract** — 307 offline
 deterministic tests, a byte-reproducible benchmark, mypy strict + ruff clean.
 `STATUS.md` lists the per-capability evidence and the remaining (documented)
 gaps; `docs/ARCHITECTURE.md` explains how the pieces fit.
@@ -100,7 +100,7 @@ uv run agentcorp resume <run_id>          # recovers RUNNING/REVIEW work
 - [x] planner / decomposer (PRD → requirements → DAG; bounded recursive split)
 - [x] scheduler / worker / reviewer / supervisor / engine facade
 - [x] CLI (`run` / `resume` / `status` / `graph` / `report` / `providers` / `cancel`)
-- [x] 289 offline tests incl. concurrency, SIGKILL recovery, budget hard-stop, chaos runs
+- [x] 307 offline tests incl. concurrency, SIGKILL recovery, budget hard-stop, chaos runs
 - [x] self-hosting benchmark report (`benchmarks/self_hosting_sim.json`)
 - [x] reserve-based token admission (see `docs/DESIGN_DECISIONS.md` DEC-022)
 - [ ] provider output cap wired from the remaining budget (C7 residual risk)

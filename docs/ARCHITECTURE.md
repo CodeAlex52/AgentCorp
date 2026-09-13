@@ -169,7 +169,7 @@ change stays in the repository and the file elsewhere keeps its content.
 
 ## Test strategy
 
-Everything is offline, deterministic and fast (277 tests, < 5 s): injected
+Everything is offline, deterministic and fast (307 tests, ~5 s): injected
 `FakeClock`, `noop_sleep`, `SequentialIdFactory`, mock/scripted providers.  Real
 concurrency (64 threads racing for one claim), real faults (chaos provider) and a
 real `SIGKILL` + `resume` subprocess test are used where mock assertions would be
