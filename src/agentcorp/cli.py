@@ -214,6 +214,12 @@ def resume(
     concurrency: int = typer.Option(4, "--concurrency", min=1),
     chaos: float = typer.Option(0.0, "--chaos", min=0.0, max=1.0),
     chaos_seed: int = typer.Option(0, "--chaos-seed"),
+    force_requeue: bool = typer.Option(
+        True,
+        "--force-requeue/--no-force-requeue",
+        help="Re-dispatch interrupted tasks even if their lease has not expired "
+        "(resume assumes the previous process is gone).",
+    ),
     json_logs: bool = typer.Option(False, "--json-logs"),
     report_out: Path | None = typer.Option(None, "--report-out"),
 ) -> None:
@@ -225,6 +231,7 @@ def resume(
         db_path=db,
         scheduler=SchedulerConfig(max_concurrency=concurrency, log_events=json_logs),
         chaos=_chaos_config(probability=chaos, seed=chaos_seed, kinds="", fail_forever=False),
+        resume_force_requeue=force_requeue,
     )
     summary = asyncio.run(_resume_async(config, run_id))
     _finish(summary.status, summary.reason, summary.report, report_out)
@@ -349,7 +356,7 @@ def cancel(
         if project is None:
             typer.echo(f"unknown run {run_id!r}", err=True)
             raise typer.Exit(1)
-        store.put_document(project.id, "cancel_request", {"reason": reason})
+        store.put_control(project.id, "cancel_request", {"reason": reason})
     finally:
         store.close()
     typer.echo(f"cancellation requested for {run_id}")

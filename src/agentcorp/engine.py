@@ -65,6 +65,10 @@ class EngineConfig:
     #: CLI overrides for the decomposition bounds.
     max_depth_override: int | None = None
     max_total_tasks_override: int | None = None
+    #: ``resume`` re-dispatches interrupted tasks even when their lease has not
+    #: expired.  That is the definition of a resume: the owning process is gone
+    #: (FIND-014).  Turn it off to require an expired lease instead.
+    resume_force_requeue: bool = True
     chaos: ChaosConfig | None = None
     deterministic: bool = False
     seed: int = 0
@@ -131,6 +135,14 @@ class Engine:
             ),
             max_subtasks=self.config.bounds.max_subtasks,
         )
+        # Fail-closed default (FIND-006): if the operator set no task ceiling,
+        # align the budget with the decomposition bound so a run can never grow
+        # past `max_total_tasks` dispatches, and the ceiling is reported as a
+        # real budget dimension rather than an absent one.
+        if self.config.budget.max_tasks is None:
+            self.config.budget = self.config.budget.model_copy(
+                update={"max_tasks": self.bounds.max_total_tasks}
+            )
 
         self.provider = provider or build_provider(self.config.provider_spec)
         if self.config.chaos is not None and not isinstance(self.provider, ChaosProvider):
@@ -234,7 +246,7 @@ class Engine:
         project_id = self._project_id or self._latest_project_id()
         if project_id is None:
             return None
-        self.store.put_document(project_id, "cancel_request", {"reason": reason})
+        self.store.put_control(project_id, "cancel_request", {"reason": reason})
         if self._scheduler is not None:
             self._scheduler.request_cancel(reason)
         return project_id
@@ -376,21 +388,34 @@ class Engine:
             tasks_started=tasks_started,
         )
 
-        # Crash recovery for orphaned RUNNING tasks (DEC-006).
+        # Crash recovery for interrupted attempts (DEC-006 / FIND-014):
+        # RUNNING *and* REVIEW tasks are recovered.  By default the lease is not
+        # consulted — `resume` means the previous process is gone — but operators
+        # can demand an expired lease with `--no-force-requeue`.
+        now = self.clock.now()
         requeued: list[str] = []
         quarantined: list[str] = []
-        for task in self.store.stale_running(self.clock.now()):
+        for task in self.store.stale_running(now, force=self.config.resume_force_requeue):
             self._emit(
                 project_id,
                 EventType.NOTE,
                 task_id=task.id,
                 payload={
                     "stage": "recovery",
-                    "summary": f"stale RUNNING task {task.id} (lease expired) is being recovered",
+                    "summary": (
+                        f"interrupted task {task.id} (status {task.status.value}, "
+                        f"attempts {task.attempts}) is being recovered"
+                    ),
                     "attempts": task.attempts,
                 },
             )
-            if self.store.recover_stale_task(task.id, now=self.clock.now()):
+            recovered = self.store.recover_task(
+                task.id,
+                reason="interrupted_by_crash",
+                now=self.clock.now(),
+                force=self.config.resume_force_requeue,
+            )
+            if recovered:
                 requeued.append(task.id)
             else:
                 quarantined.append(task.id)

@@ -182,6 +182,8 @@ class Scheduler:
         while True:
             self._poll_stop_documents()
             if not self.stopping:
+                if self._recover_orphans():
+                    continue
                 self._promote()
                 self._aggregate()
                 self._propagate_poison()
@@ -197,6 +199,8 @@ class Scheduler:
                 return self._finish_run()
             if self.graph.all_terminal():
                 return self._finish_run()
+            if self._recover_orphans():
+                continue
             progressed = self._promote() + self._aggregate() + self._propagate_poison()
             if progressed:
                 continue
@@ -348,7 +352,7 @@ class Scheduler:
             if claimed is None:
                 self._task(task.id)  # lost the race: refresh and retry
                 continue
-            self.budget.note_task_started()
+            self.budget.note_task_started(task_id=task.id)
             for event in claimed:
                 self.supervisor.observe(event)
             self._refresh(task.id)
@@ -743,7 +747,7 @@ class Scheduler:
     def _poll_stop_documents(self) -> None:
         if self.stopping:
             return
-        document = self.store.get_document(self.project_id, "cancel_request")
+        document = self.store.get_control(self.project_id, "cancel_request")
         if document:
             self._begin_stop("cancel", str(document.get("reason", "cancel requested")))
 
@@ -821,6 +825,54 @@ class Scheduler:
                 except StateError:  # pragma: no cover - raced with a transition
                     continue
                 self._refresh(task.id)
+
+    def _recover_orphans(self) -> bool:
+        """Re-dispatch attempts that no coroutine in this process owns (FIND-014).
+
+        A RUNNING/REVIEW task with no in-flight coroutine is proof that the
+        previous process died mid-claim (or that a claim was never executed).
+        Without this, the deadlock detector would see "no running, no ready" and
+        destroy the whole run instead of resuming it.
+
+        v0 runs one engine process per run; `agentcorp resume` is the documented
+        takeover, so the recovery is forced rather than waiting for the lease.
+        """
+        changed = False
+        for task in sorted(self.graph.tasks, key=lambda t: t.id):
+            if task.status not in {TaskStatus.RUNNING, TaskStatus.REVIEW}:
+                continue
+            if task.id in self._inflight or task.id in self._abort_silently:
+                continue
+            self._emit(
+                EventType.NOTE,
+                task.id,
+                {
+                    "stage": "recovery",
+                    "summary": (
+                        f"orphaned {task.status.value} task {task.id} has no owner; "
+                        "re-dispatching"
+                    ),
+                    "attempts": task.attempts,
+                },
+            )
+            recovered = self.store.recover_task(
+                task.id,
+                reason="orphaned_attempt",
+                now=self.clock.now(),
+                force=True,
+            )
+            self._refresh(task.id)
+            changed = True
+            if not recovered:
+                self._emit(
+                    EventType.NOTE,
+                    task.id,
+                    {
+                        "stage": "recovery",
+                        "summary": f"orphaned task {task.id} could not be requeued (attempts exhausted)",
+                    },
+                )
+        return changed
 
     def _quarantine_stranded(self) -> bool:
         """A FAILED task with no attempts left can never move; isolate it.

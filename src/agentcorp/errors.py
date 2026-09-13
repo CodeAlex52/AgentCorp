@@ -10,6 +10,7 @@ from __future__ import annotations
 __all__ = [
     "AgentCorpError",
     "TransientError",
+    "ProviderBilledError",
     "RateLimitError",
     "TimeoutError_",
     "ProviderError",
@@ -26,15 +27,36 @@ __all__ = [
 
 
 class AgentCorpError(Exception):
-    """Base class for every error AgentCorp raises deliberately."""
+    """Base class for every error AgentCorp raises deliberately.
+
+    ``usage`` is the billing escape hatch (FIND-001): a provider that spent
+    tokens before failing attaches what it spent here and the runtime books it,
+    so a failing call can never silently bypass the budget.
+    """
 
     retryable: bool = False
+    #: ``{"tokens_in": int, "tokens_out": int, "calls": int, "cost_usd": float}``
+    #: or a ``Usage`` instance; ``None`` means "provider reported nothing".
+    usage: object | None = None
+
 
 
 class TransientError(AgentCorpError):
     """Something that is expected to succeed if we simply try again."""
 
     retryable = True
+
+
+class ProviderBilledError(TransientError):
+    """A transient provider failure that still consumed metered resources.
+
+    Prefer this over a bare ``TransientError`` when the provider was already
+    paid for the attempt; the runtime books ``usage`` even though the call fails.
+    """
+
+    def __init__(self, message: str, *, usage: object | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 class RateLimitError(TransientError):

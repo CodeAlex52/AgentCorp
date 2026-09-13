@@ -68,6 +68,16 @@ class TaskGraph:
 
     # ------------------------------------------------------------- mutation
     def add(self, task: Task) -> None:
+        """Add or replace a task. Replacing drops the previous edges first.
+
+        Without this, `add()` with an existing id silently merged the old and
+        new dependency sets — `validate()` could not see the phantom ordering
+        (FIND-008).
+        """
+        if task.id in self._nx:
+            for dep in list(self._nx.predecessors(task.id)):
+                self._dependents[dep].discard(task.id)
+                self._nx.remove_edge(dep, task.id)
         self._tasks[task.id] = task
         self._nx.add_node(task.id)
         for dep in task.dependencies:
@@ -75,17 +85,7 @@ class TaskGraph:
             self._nx.add_edge(dep, task.id)
 
     def update(self, task: Task) -> None:
-        """Replace a task, re-reading its dependencies.
-
-        Edges are removed by consulting the *graph*, not the (possibly already
-        mutated) task object — ``rewire()`` used to mutate the dependent before
-        calling this, which left a stale ``parent -> dependent`` edge and made
-        ``stuck_parents()`` fire on healthy splits (BASELINE_AUDIT DEF-04).
-        """
-        if task.id in self._nx:
-            for dep in list(self._nx.predecessors(task.id)):
-                self._dependents[dep].discard(task.id)
-                self._nx.remove_edge(dep, task.id)
+        """Replace a task, re-reading its dependencies (see :meth:`add`)."""
         self.add(task)
 
     def replace_all(self, tasks: Iterable[Task]) -> None:
@@ -296,8 +296,14 @@ class TaskGraph:
         except nx.NetworkXNoCycle:
             return []
 
-    def validate(self, *, strict_parents: bool = False) -> None:
-        """Raise :class:`GraphError` if the structure is not a usable DAG."""
+    def validate(self, *, strict_parents: bool = True) -> None:
+        """Raise :class:`GraphError` if the structure is not a usable DAG.
+
+        Orphans (a ``parent_id`` pointing at a node that does not exist) are
+        rejected by default: the parent pointer is the only structural record of
+        a decomposition, so an orphan would silently escape aggregation (C3,
+        FIND-007).  Pass ``strict_parents=False`` only for partial subgraphs.
+        """
         cycle = self.find_cycle()
         if cycle:
             chain = " -> ".join(str(edge[0]) for edge in cycle) + f" -> {cycle[0][0]}"

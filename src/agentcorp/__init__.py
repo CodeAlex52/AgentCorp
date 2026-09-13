@@ -47,6 +47,7 @@ from .errors import (
     DecompositionError,
     GraphError,
     PermanentError,
+    ProviderBilledError,
     ProviderError,
     RateLimitError,
     SchemaError,
@@ -61,6 +62,7 @@ from .models import (
     ALLOWED_TRANSITIONS,
     TERMINAL_STATUSES,
     AcceptanceCriterion,
+    AgentRun,
     Artifact,
     BudgetLimits,
     BudgetSnapshot,
@@ -80,6 +82,7 @@ from .models import (
     Usage,
     WorkerOutcome,
     assert_transition,
+    transition_allowed,
 )
 from .planner import plan_tasks
 from .prd import heuristic_requirement, parse_requirement
@@ -94,7 +97,7 @@ from .runtime import AgentRuntime
 from .scheduler import RunOutcome, Scheduler, SchedulerConfig
 from .store import Store
 from .supervisor import Supervisor, SupervisorConfig
-from .util import FakeClock, SequentialIdFactory, SystemClock, noop_sleep
+from .util import FakeClock, SequentialIdFactory, SystemClock, noop_sleep, system_sleep
 from .worker import PathViolationError, Worker, validate_write_path
 
 __version__ = "0.1.0"
@@ -117,6 +120,7 @@ __all__ = [
     "Review",
     "ReviewIssue",
     "Artifact",
+    "AgentRun",
     "Project",
     "SupervisorFinding",
     "Intervention",
@@ -125,6 +129,7 @@ __all__ = [
     "ALLOWED_TRANSITIONS",
     "TERMINAL_STATUSES",
     "assert_transition",
+    "transition_allowed",
     # facts
     "Event",
     "EventType",
@@ -181,6 +186,7 @@ __all__ = [
     "TransientError",
     "RateLimitError",
     "TimeoutError_",
+    "ProviderBilledError",
     "ProviderError",
     "ContextOverflowError",
     "SchemaError",
@@ -196,4 +202,5 @@ __all__ = [
     "SystemClock",
     "SequentialIdFactory",
     "noop_sleep",
+    "system_sleep",
 ]

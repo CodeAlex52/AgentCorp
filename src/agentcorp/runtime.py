@@ -28,7 +28,7 @@ from .providers.base import AgentProvider, CompletionRequest, Message, estimate_
 from .reliability import CircuitBreaker, RetryOutcome, RetryPolicy, TokenBucket, call_with_retry
 from .util import Clock, Sleeper, SystemClock, content_hash, system_sleep
 
-__all__ = ["AgentRuntime", "RuntimeResult", "RunRecorder"]
+__all__ = ["AgentRuntime", "RuntimeResult", "RunRecorder", "usage_from_exception"]
 
 
 @dataclass
@@ -134,6 +134,10 @@ class AgentRuntime:
         recovered: list[str] = []
         started_monotonic = self.clock.monotonic()
         attempts_seen = 0
+        #: Usage of *every* attempt, including ones that ended in an error.
+        #: The baseline overwrote this per attempt, so retried/failed work was
+        #: silently unbilled and the token ceiling could be bypassed (FIND-001).
+        charged = Usage()
 
         async def attempt_closure(attempt: int) -> str:
             nonlocal shrinks, attempts_seen
@@ -149,6 +153,7 @@ class AgentRuntime:
                 # shrink must re-raise something *retryable*: the taxonomy marks
                 # ContextOverflowError non-retryable precisely because
                 # retrying it unchanged is pointless (BASELINE_AUDIT DEF-03).
+                charged.add_in_place(usage_from_exception(exc, fallback_tokens=estimate))
                 if shrinks >= self.max_context_shrinks:
                     raise
                 shrinks += 1
@@ -159,7 +164,11 @@ class AgentRuntime:
                     f"with {len(request.messages)} message(s)"
                 )
                 raise TransientError(msg) from exc
-            run.usage = response.usage
+            except BaseException as exc:
+                charged.add_in_place(usage_from_exception(exc, fallback_tokens=estimate))
+                raise
+            charged.add_in_place(response.usage)
+            run.usage = charged
             run.response = response.text
             run.response_hash = content_hash(response.text)
             run.model = response.model
@@ -182,8 +191,9 @@ class AgentRuntime:
             run.error = str(exc)
             run.error_type = type(exc).__name__
             run.finished_at = self.clock.now()
+            run.usage = charged
+            run.usage.calls = max(charged.calls, attempts_seen or outcome.attempts or 1)
             run.usage.duration_s = round(self.clock.monotonic() - started_monotonic, 4)
-            run.usage.calls = attempts_seen or outcome.attempts or 1
             self._record(run, finished=True)
             if self.budget is not None:
                 self.budget.record(run.usage, task_id=task_id)
@@ -192,8 +202,9 @@ class AgentRuntime:
             self.breaker.on_success()
             run.ok = True
             run.finished_at = self.clock.now()
+            run.usage = charged
+            run.usage.calls = max(charged.calls, attempts_seen or 1)
             run.usage.duration_s = round(self.clock.monotonic() - started_monotonic, 4)
-            run.usage.calls = attempts_seen or 1
             run.usage.cost_usd = (
                 run.usage.cost_usd
                 if run.usage.cost_usd
@@ -265,6 +276,39 @@ def _coerce_messages(messages: Sequence[Message | dict[str, str]]) -> list[Messa
             message if isinstance(message, Message) else Message.model_validate(message)
         )
     return out
+
+
+def usage_from_exception(exc: BaseException, *, fallback_tokens: int = 0) -> Usage:
+    """Usage a failed attempt should be billed for (C7, FIND-001).
+
+    Order of preference:
+
+    1. ``exc.usage`` (a :class:`Usage` or a dict) — set by providers that know
+       what they spent before failing (:class:`~agentcorp.errors.ProviderBilledError`);
+    2. ``exc.tokens`` — the shape :class:`~agentcorp.errors.ContextOverflowError`
+       already carries;
+    3. the pre-flight prompt estimate — "dispatched but not reported" is billed
+       pessimistically rather than free.
+    """
+    raw = getattr(exc, "usage", None)
+    if isinstance(raw, Usage):
+        return raw.model_copy()
+    if isinstance(raw, dict):
+        try:
+            return Usage.model_validate(
+                {
+                    "tokens_in": int(raw.get("tokens_in", 0)),
+                    "tokens_out": int(raw.get("tokens_out", 0)),
+                    "calls": int(raw.get("calls", 1)),
+                    "cost_usd": float(raw.get("cost_usd", 0.0)),
+                }
+            )
+        except (TypeError, ValueError):  # pragma: no cover - malformed provider data
+            pass
+    tokens = getattr(exc, "tokens", None)
+    if isinstance(tokens, int) and tokens > 0:
+        return Usage(tokens_in=tokens, calls=1)
+    return Usage(tokens_in=max(fallback_tokens, 0), calls=1)
 
 
 def _shrink_largest(messages: list[Message], keep_ratio: float = 0.5) -> list[Message]:

@@ -12,6 +12,9 @@ strategy.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -27,6 +30,19 @@ __all__ = ["Worker", "WorkerResult", "PathViolationError", "validate_write_path"
 
 _MAX_SCHEMA_RETRIES = 2
 _MAX_FILE_BYTES = 2_000_000  # 2 MB per file: a model reply cannot be larger anyway
+
+#: Directories that must never be written through, compared case-folded and
+#: unicode-normalised: on a case-insensitive filesystem (macOS/APFS, Windows)
+#: ``.GIT/config`` *is* ``.git/config`` (FIND-011).
+_VCS_DIR_NAMES: frozenset[str] = frozenset({".git", ".hg", ".svn", ".bzr"})
+_VCS_DIR_KEYS: frozenset[str] = frozenset(
+    unicodedata.normalize("NFC", name).casefold() for name in _VCS_DIR_NAMES
+)
+
+
+def _is_vcs_component(part: str) -> bool:
+    return unicodedata.normalize("NFC", part).casefold() in _VCS_DIR_KEYS
+
 
 #: Keys models spell differently -> canonical WorkerOutcome field.
 _ALIASES: dict[str, str] = {
@@ -259,7 +275,7 @@ def validate_write_path(
         raise PathViolationError(f"absolute paths are not allowed: {path!r}")
     if any(part == ".." for part in pure.parts):
         raise PathViolationError(f"path traversal is not allowed: {path!r}")
-    if any(part in {".git", ".hg", ".svn"} for part in pure.parts):
+    if any(_is_vcs_component(part) for part in pure.parts):
         raise PathViolationError(f"writes into version-control metadata are not allowed: {path!r}")
     if not pure.parts:
         raise PathViolationError(f"path resolves to nothing: {path!r}")
@@ -274,8 +290,33 @@ def validate_write_path(
         raise PathViolationError(
             f"path escapes the repository root: {path!r} -> {resolved}"
         )
+    # Re-check the *real* path: a symlinked or case-folded component may only become
+    # visible after resolution.
+    try:
+        relative_parts = resolved.relative_to(base).parts
+    except ValueError:  # pragma: no cover - covered by the root check above
+        relative_parts = resolved.parts
+    if any(_is_vcs_component(part) for part in relative_parts):
+        raise PathViolationError(
+            f"writes into version-control metadata are not allowed: {path!r}"
+        )
     if resolved.exists() and resolved.is_dir():
         raise PathViolationError(f"path is a directory: {path!r}")
+    if resolved.exists():
+        # Hard links are indistinguishable from normal files by path alone: a
+        # repository can carry one that aliases a file outside the sandbox, so
+        # any inode with more than one name is refused (FIND-013, DEC-017).
+        try:
+            info = os.lstat(resolved)
+        except OSError as exc:  # pragma: no cover - raced deletion
+            raise PathViolationError(f"cannot stat {path!r}: {exc}") from exc
+        if not stat.S_ISREG(info.st_mode) and not stat.S_ISFIFO(info.st_mode):
+            raise PathViolationError(f"refusing to write through {path!r}: not a regular file")
+        if info.st_nlink > 1:
+            raise PathViolationError(
+                f"refusing to write through {path!r}: hard link (nlink={info.st_nlink}) "
+                "may alias a file outside the repository"
+            )
 
     if strict_touch and touch_paths:
         allowed = [_normalise_touch(t) for t in touch_paths]

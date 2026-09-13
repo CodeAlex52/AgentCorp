@@ -45,6 +45,10 @@ class RetryPolicy:
     multiplier: float = 2.0
     jitter: float = 1.0
     respect_retry_after: bool = True
+    #: Absolute sanity cap for a server-provided ``Retry-After``.  This is *not*
+    #: ``max_delay``: an explicit "come back in 120s" must not be clamped to 30s
+    #: and pounded early (FIND-012).
+    max_retry_after: float = 3600.0
 
     def nominal_delay(self, attempt: int) -> float:
         """Deterministic backoff for ``attempt`` (1-based), before jitter."""
@@ -112,11 +116,17 @@ async def call_with_retry[T](
                     on_attempt(attempt, exc, 0.0)
                 raise
             delay = policy.delay_for(attempt, rng)
+            server_delay: float | None = None
             if policy.respect_retry_after and isinstance(exc, RateLimitError) and exc.retry_after:
-                delay = max(delay, float(exc.retry_after))
+                server_delay = float(exc.retry_after)
             if isinstance(exc, CircuitOpenError) and exc.retry_after:
-                delay = max(delay, float(exc.retry_after))
-            delay = min(delay, policy.max_delay)
+                server_delay = max(server_delay or 0.0, float(exc.retry_after))
+            if server_delay is not None:
+                # Server instruction wins over the computed backoff cap; only the
+                # absolute sanity cap applies.
+                delay = min(max(delay, server_delay), policy.max_retry_after)
+            else:
+                delay = min(delay, policy.max_delay)
             book.delays.append(delay)
             # Exactly one callback per failed attempt, carrying the real delay
             # (the baseline fired twice, duplicating every retry NOTE event).
@@ -314,18 +324,24 @@ class TokenBucket:
         self._last = now
         self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
 
+    #: Float slack for "have we refilled enough?" checks.  Without it a bucket
+    #: whose clock sits at a large monotonic value (FakeClock starts at 1e6)
+    #: refills to 0.9999999997 instead of 1.0 and `acquire` spins forever on
+    #: 2e-11 second sleeps — a real starvation bug found by the test-suite.
+    _EPSILON = 1e-9
+
     def try_acquire(self, tokens: float = 1.0) -> bool:
         with self._lock:
             self._refill()
-            if self._tokens >= tokens:
-                self._tokens -= tokens
+            if self._tokens >= tokens - self._EPSILON:
+                self._tokens = max(self._tokens - tokens, 0.0)
                 return True
             return False
 
     def time_until(self, tokens: float = 1.0) -> float:
         with self._lock:
             self._refill()
-            if self._tokens >= tokens:
+            if self._tokens >= tokens - self._EPSILON:
                 return 0.0
             return (tokens - self._tokens) / self.rate
 

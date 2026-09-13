@@ -82,16 +82,31 @@ class BudgetManager:
         self.started_monotonic = (
             started_monotonic if started_monotonic is not None else self.clock.monotonic()
         )
-        #: Dispatches, not calls: `max_tasks` counts claimed tasks.
+        #: Dispatches, not calls: `max_tasks` counts distinct tasks that were
+        #: claimed or accounted for.  Derived automatically from `record()` so a
+        #: caller that forgets `note_task_started()` cannot silently disable the
+        #: ceiling (FIND-006).
         self.tasks_started = tasks_started
+        self._seen_tasks: set[str] = set()
         self._warned = False
 
     # ------------------------------------------------------------------- clock
     def elapsed_seconds(self) -> float:
         return max(self.clock.monotonic() - self.started_monotonic, 0.0)
 
-    def note_task_started(self, count: int = 1) -> None:
+    def note_task_started(self, count: int = 1, *, task_id: str | None = None) -> None:
+        """Count a dispatch.  Idempotent per task id when one is supplied."""
+        if task_id is not None:
+            if task_id in self._seen_tasks:
+                return
+            self._seen_tasks.add(task_id)
         self.tasks_started += count
+
+    def _would_consume_task_slot(self, task_id: str | None) -> bool:
+        """Fail-closed: an unspecified task counts as a fresh dispatch."""
+        if task_id is None:
+            return True
+        return task_id not in self._seen_tasks
 
     # ------------------------------------------------------------- accounting
     def record(self, usage: Usage, *, task_id: str | None = None) -> None:
@@ -99,6 +114,11 @@ class BudgetManager:
         self.project.add(usage)
         if task_id is not None:
             self.by_task.setdefault(task_id, _Ledger()).add(usage)
+            if task_id not in self._seen_tasks:
+                # Auto-derive the task count from accounting: even a caller that
+                # never calls note_task_started() gets a fail-closed ceiling.
+                self._seen_tasks.add(task_id)
+                self.tasks_started += 1
         self._records_since_emit += 1
         if self._emit is not None and self._records_since_emit >= self._emit_every:
             self._records_since_emit = 0
@@ -142,89 +162,99 @@ class BudgetManager:
             self.tasks_started = tasks_started
         self.refusals.clear()
         self._warned = False
+        self._seen_tasks.clear()
 
     def status(
         self,
         *,
         task_id: str | None = None,
         estimated_tokens: int = 0,
-        new_task: bool = False,
+        new_task: bool | None = None,
     ) -> BudgetStatus:
         """Would a call costing ``estimated_tokens`` be allowed right now?
 
-        ``new_task`` must be set by the scheduler when the call would consume a
-        fresh task dispatch, so the ``max_tasks`` ceiling is honoured
-        (check-before-dispatch, SPEC §5.3).
+        The ``max_tasks`` ceiling is evaluated for any call whose ``task_id`` has
+        not consumed a slot yet — including calls that omit ``task_id`` — so the
+        default check path is fail-closed (SPEC §5.3, FIND-006).  Pass
+        ``new_task=False`` to explicitly exempt an in-flight call.
         """
         lim = self.limits
         used = self.project.usage
         used_tokens = used.total_tokens
         used_cost = used.cost_usd
         used_calls = used.calls
+        remaining_tokens = self.remaining_tokens(estimated_tokens)
+        remaining_cost = (
+            None if lim.max_cost_usd is None else max(lim.max_cost_usd - used_cost, 0.0)
+        )
+        remaining_calls = (
+            None if lim.max_agent_calls is None else max(lim.max_agent_calls - used_calls, 0)
+        )
+        remaining_tasks = (
+            None if lim.max_tasks is None else max(lim.max_tasks - self.tasks_started, 0)
+        )
+        remaining_seconds = (
+            None
+            if lim.max_wall_seconds is None
+            else max(lim.max_wall_seconds - self.elapsed_seconds(), 0.0)
+        )
+
+        def refuse(reason: str, limit: str, scope: str = "project") -> BudgetStatus:
+            return BudgetStatus(
+                False,
+                reason,
+                limit,
+                scope,
+                remaining_tokens=remaining_tokens,
+                remaining_cost_usd=remaining_cost,
+                remaining_calls=remaining_calls,
+                remaining_tasks=remaining_tasks,
+                remaining_seconds=remaining_seconds,
+            )
 
         if lim.max_agent_calls is not None and used_calls >= lim.max_agent_calls:
-            return BudgetStatus(
-                False,
+            return refuse(
                 f"project agent-call ceiling: {used_calls}/{lim.max_agent_calls} calls used",
                 "max_agent_calls",
-                "project",
             )
-        if lim.max_tasks is not None and new_task and self.tasks_started >= lim.max_tasks:
-            return BudgetStatus(
-                False,
+        consumes_slot = self._would_consume_task_slot(task_id) if new_task is None else new_task
+        if lim.max_tasks is not None and consumes_slot and self.tasks_started >= lim.max_tasks:
+            return refuse(
                 f"project task ceiling: {self.tasks_started}/{lim.max_tasks} tasks dispatched",
                 "max_tasks",
-                "project",
             )
         if lim.max_tokens is not None and (
             used_tokens >= lim.max_tokens or used_tokens + estimated_tokens > lim.max_tokens
         ):
-            return BudgetStatus(
-                False,
+            return refuse(
                 f"project token ceiling: used {used_tokens} + est {estimated_tokens} > {lim.max_tokens}",
                 "max_tokens",
-                "project",
             )
         if lim.max_cost_usd is not None and used_cost >= lim.max_cost_usd:
-            return BudgetStatus(
-                False,
+            return refuse(
                 f"project cost ceiling: used ${used_cost:.4f} >= ${lim.max_cost_usd:.4f}",
                 "max_cost_usd",
-                "project",
             )
         if lim.max_wall_seconds is not None and self.elapsed_seconds() >= lim.max_wall_seconds:
-            return BudgetStatus(
-                False,
+            return refuse(
                 f"project wall-clock ceiling: {self.elapsed_seconds():.1f}s >= {lim.max_wall_seconds:.1f}s",
                 "max_wall_seconds",
-                "project",
             )
         if task_id is not None and lim.max_tokens_per_task is not None:
             task_used = self.by_task.get(task_id, _Ledger()).usage.total_tokens
             if task_used + estimated_tokens > lim.max_tokens_per_task:
-                return BudgetStatus(
-                    False,
+                return refuse(
                     f"task token ceiling: used {task_used} + est {estimated_tokens} > {lim.max_tokens_per_task}",
                     "max_tokens_per_task",
                     "task",
                 )
         return BudgetStatus(
             True,
-            remaining_tokens=self.remaining_tokens(estimated_tokens),
-            remaining_cost_usd=(
-                None if lim.max_cost_usd is None else max(lim.max_cost_usd - self.project.usage.cost_usd, 0.0)
-            ),
-            remaining_calls=(
-                None if lim.max_agent_calls is None else max(lim.max_agent_calls - self.project.usage.calls, 0)
-            ),
-            remaining_tasks=(
-                None if lim.max_tasks is None else max(lim.max_tasks - self.tasks_started, 0)
-            ),
-            remaining_seconds=(
-                None
-                if lim.max_wall_seconds is None
-                else max(lim.max_wall_seconds - self.elapsed_seconds(), 0.0)
-            ),
+            remaining_tokens=remaining_tokens,
+            remaining_cost_usd=remaining_cost,
+            remaining_calls=remaining_calls,
+            remaining_tasks=remaining_tasks,
+            remaining_seconds=remaining_seconds,
         )
 
     def check(
@@ -232,7 +262,7 @@ class BudgetManager:
         *,
         task_id: str | None = None,
         estimated_tokens: int = 0,
-        new_task: bool = False,
+        new_task: bool | None = None,
     ) -> None:
         """Raise :class:`BudgetExceededError` if the next call must not happen."""
         status = self.status(task_id=task_id, estimated_tokens=estimated_tokens, new_task=new_task)

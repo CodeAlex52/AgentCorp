@@ -66,6 +66,6 @@ ignore = ["E501"]
 # typer's documented API is `param: T = typer.Option(...)` in the signature.
 "src/agentcorp/cli.py" = ["B008"]
 # Test / example files legitimately abuse unused fixture arguments and locals.
-"tests/*" = ["ARG001", "ARG002", "F841", "B011"]
+"tests/*" = ["ARG001", "ARG002", "ARG005", "F841", "B011"]
 "examples/*" = ["ARG001", "T201", "PTH"]
 "scripts/*" = ["T201"]

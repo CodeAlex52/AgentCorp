@@ -44,7 +44,7 @@ from .models import (
     Usage,
     assert_transition,
 )
-from .util import short_hash, utcnow
+from .util import new_id, short_hash, utcnow
 
 __all__ = ["Store", "DEFAULT_DB_NAME"]
 
@@ -53,6 +53,7 @@ DEFAULT_DB_NAME = "agentcorp.db"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_seq        INTEGER NOT NULL DEFAULT 0,
     event_id       TEXT    NOT NULL,
     project_id     TEXT    NOT NULL,
     type           TEXT    NOT NULL,
@@ -62,7 +63,9 @@ CREATE TABLE IF NOT EXISTS events (
     schema_version INTEGER NOT NULL DEFAULT 1,
     created_at     TEXT    NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, run_seq);
+-- FIND-005: at-least-once redelivery must not duplicate the audit log.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id);
 CREATE INDEX IF NOT EXISTS idx_events_task    ON events(task_id, seq);
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -155,6 +158,16 @@ CREATE TABLE IF NOT EXISTS derived (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (project_id, key)
 );
+
+-- Cross-process control signals (cancel requests).  Inputs, not outputs: they
+-- must survive projection rebuilds and are never derived from the log.
+CREATE TABLE IF NOT EXISTS control (
+    project_id TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    data       TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, key)
+);
 """
 
 #: Tables wiped by rebuild.  ``events`` is deliberately not here.
@@ -199,6 +212,35 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring a pre-existing dev database up to the current schema.
+
+        v0 has no data in the wild, but silently reading an older file as if it
+        had ``run_seq`` would corrupt ordering guarantees, so backfill it once.
+        """
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "run_seq" not in columns:  # pragma: no cover - only on legacy files
+            self._conn.execute("ALTER TABLE events ADD COLUMN run_seq INTEGER NOT NULL DEFAULT 0")
+            projects = [
+                str(row["project_id"])
+                for row in self._conn.execute("SELECT DISTINCT project_id FROM events").fetchall()
+            ]
+            for project_id in projects:
+                rows = self._conn.execute(
+                    "SELECT seq FROM events WHERE project_id=? ORDER BY seq", (project_id,)
+                ).fetchall()
+                for index, row in enumerate(rows, start=1):
+                    self._conn.execute(
+                        "UPDATE events SET run_seq=? WHERE seq=?", (index, int(row["seq"]))
+                    )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id)"
+        )
 
     # ------------------------------------------------------------------ basics
     def close(self) -> None:
@@ -218,32 +260,56 @@ class Store:
 
     # ------------------------------------------------------------------ events
     def _insert_event(self, conn: sqlite3.Connection, event: Event) -> Event:
-        """Insert + project one event on an open transaction. Never commits."""
-        cur = conn.execute(
-            "INSERT INTO events (event_id, project_id, type, task_id, actor, payload,"
-            " schema_version, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        """Insert + project one event on an open transaction. Never commits.
+
+        * ``run_seq`` is a per-project counter, so a run's stream is contiguous
+          even when several runs share one SQLite file (FIND-009); ``Event.seq``
+          is that run-scoped value.
+        * An explicit ``event_id`` makes the append idempotent (FIND-005):
+          re-delivering the same fact returns the stored event and projects
+          nothing twice; the same id with different content is a hard error.
+        """
+        payload_json = json.dumps(event.payload, default=str)
+        if event.event_id:
+            existing = conn.execute(
+                "SELECT * FROM events WHERE event_id=?", (event.event_id,)
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["project_id"]) != event.project_id
+                    or str(existing["type"]) != event.type.value
+                    or existing["task_id"] != event.task_id
+                    or json.loads(existing["payload"]) != event.payload
+                ):
+                    msg = (
+                        f"event_id {event.event_id!r} already exists with different content"
+                    )
+                    raise StateError(msg)
+                return self._row_to_event(existing)
+            event_id = event.event_id
+        else:
+            event_id = new_id("EV")
+        run_seq_row = conn.execute(
+            "SELECT COALESCE(MAX(run_seq), 0) AS m FROM events WHERE project_id=?",
+            (event.project_id,),
+        ).fetchone()
+        run_seq = int(run_seq_row["m"]) + 1 if run_seq_row is not None else 1
+        conn.execute(
+            "INSERT INTO events (run_seq, event_id, project_id, type, task_id, actor, payload,"
+            " schema_version, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (
-                event.event_id
-                or short_hash(
-                    [
-                        event.project_id,
-                        event.type.value,
-                        event.created_at.isoformat(),
-                        event.task_id,
-                        event.payload,
-                    ],
-                    16,
-                ),
+                run_seq,
+                event_id,
                 event.project_id,
                 event.type.value,
                 event.task_id,
                 event.actor,
-                json.dumps(event.payload, default=str),
+                payload_json,
                 event.schema_version,
                 event.created_at.isoformat(),
             ),
         )
-        stored = event.with_seq(int(cur.lastrowid or 0))
+        stored = event.with_seq(run_seq)
         self._project(conn, stored)
         return stored
 
@@ -273,7 +339,7 @@ class Store:
         types: Sequence[EventType] | None = None,
         limit: int | None = None,
     ) -> list[Event]:
-        sql = "SELECT * FROM events WHERE project_id=? AND seq>?"
+        sql = "SELECT * FROM events WHERE project_id=? AND run_seq>?"
         args: list[Any] = [project_id, since_seq]
         if task_id is not None:
             sql += " AND task_id=?"
@@ -281,7 +347,7 @@ class Store:
         if types:
             sql += f" AND type IN ({','.join('?' * len(types))})"
             args.extend(t.value for t in types)
-        sql += " ORDER BY seq"
+        sql += " ORDER BY run_seq"
         if limit is not None:
             sql += " LIMIT ?"
             args.append(limit)
@@ -303,9 +369,9 @@ class Store:
         """All seq values for one project, ascending (gap + monotonicity tests)."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT seq FROM events WHERE project_id=? ORDER BY seq", (project_id,)
+                "SELECT run_seq FROM events WHERE project_id=? ORDER BY run_seq", (project_id,)
             ).fetchall()
-        return [int(r["seq"]) for r in rows]
+        return [int(r["run_seq"]) for r in rows]
 
     def event_type_counts(self, project_id: str) -> dict[str, int]:
         with self._lock:
@@ -408,22 +474,40 @@ class Store:
                 ),
             )
 
-    def stale_running(self, now: datetime | None = None) -> list[Task]:
-        """RUNNING tasks whose lease expired — orphans from a crash (C5).
+    #: Statuses an interrupted attempt can be left in (C5).  REVIEW is included
+    #: because a crash between REVIEW_STARTED and the verdict is just as
+    #: orphaned as one mid-RUNNING (FIND-014).
+    RECOVERABLE_STATUSES: frozenset[TaskStatus] = frozenset(
+        {TaskStatus.RUNNING, TaskStatus.REVIEW}
+    )
 
-        Tasks without a lease (claimed by older code) fall back to
-        ``started_at`` and are considered stale immediately, which is the safe
-        direction for recovery.
+    def stale_running(self, now: datetime | None = None, *, force: bool = False) -> list[Task]:
+        """Interrupted tasks whose attempt cannot be alive any more (C5).
+
+        A task is stale when ``now > lease_expires_at`` (or it never had a
+        lease, which is the safe direction for recovery).  ``force=True`` is the
+        explicit "the owning process is gone" override used by ``resume``.
         """
         at = now or utcnow()
         out: list[Task] = []
         for task in self.list_tasks_all():
-            if task.status is not TaskStatus.RUNNING:
+            if task.status not in self.RECOVERABLE_STATUSES:
                 continue
-            deadline = task.lease_expires_at or task.started_at
-            if deadline is None or deadline <= at:
+            if force:
+                out.append(task)
+                continue
+            deadline = task.lease_expires_at or task.started_at or task.updated_at
+            if deadline <= at:
                 out.append(task)
         return out
+
+    def lease_alive(self, task: Task, now: datetime | None = None) -> bool:
+        """True when the task's lease has not expired yet."""
+        if task.status not in self.RECOVERABLE_STATUSES:
+            return False
+        at = now or utcnow()
+        deadline = task.lease_expires_at or task.started_at or task.updated_at
+        return deadline > at
 
     def list_tasks_all(self) -> list[Task]:
         """Every task in the store, across projects (recovery sweeps)."""
@@ -431,26 +515,45 @@ class Store:
             rows = self._conn.execute("SELECT data FROM tasks ORDER BY id").fetchall()
         return [Task.model_validate(json.loads(r["data"])) for r in rows]
 
-    def recover_stale_task(
+    def recover_task(
         self,
         task_id: str,
         *,
         reason: str = "lease_expired",
         now: datetime | None = None,
-        max_attempts: int | None = None,
+        force: bool = False,
     ) -> bool:
-        """Re-dispatch an orphaned RUNNING task through the legal two-step path.
+        """Re-dispatch an interrupted RUNNING/REVIEW task through a legal path.
 
-        ``RUNNING -> FAILED -> READY`` (DEC-006): the crash consumes one attempt;
-        if the attempt budget is spent the task is quarantined instead.  Returns
-        ``True`` when the task is READY again.
+        ``RUNNING|REVIEW -> FAILED -> READY`` (DEC-006): the interrupted attempt
+        counts as a failure; when the attempt budget is spent the task is
+        quarantined instead.  Returns ``True`` when the task is READY again.
+
+        * ``force=False`` (default) refuses to touch a task whose lease is still
+          valid, so a live worker can never be double-dispatched (FIND-002).
+        * The first step is a guarded ``UPDATE ... WHERE status IN (...)'', so
+          concurrent resumers lose cleanly with ``False`` instead of raising
+          ``StateError`` (FIND-003), exactly like :meth:`claim_task`.
         """
         at = now or utcnow()
         with self._tx() as conn:
             task = self._load_task(conn, task_id)
-            if task.status is not TaskStatus.RUNNING:
+            if task.status not in self.RECOVERABLE_STATUSES:
+                return False
+            if not force and self.lease_alive(task, at):
                 return False
             project_id = self._project_of(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status=? WHERE id=? AND status IN (?,?)",
+                (
+                    TaskStatus.FAILED.value,
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.REVIEW.value,
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
             self._insert_event(
                 conn,
                 Event(
@@ -463,8 +566,7 @@ class Store:
                 ),
             )
             refreshed = self._load_task(conn, task_id)
-            limit = max_attempts if max_attempts is not None else refreshed.max_attempts
-            if refreshed.attempts >= limit or refreshed.attempts >= refreshed.max_attempts:
+            if refreshed.attempts >= refreshed.max_attempts:
                 self._insert_event(
                     conn,
                     Event(
@@ -490,11 +592,24 @@ class Store:
             )
         return True
 
+    #: Backwards-compatible name; prefer :meth:`recover_task`.
+    def recover_stale_task(
+        self,
+        task_id: str,
+        *,
+        reason: str = "lease_expired",
+        now: datetime | None = None,
+        max_attempts: int | None = None,
+        force: bool = False,
+    ) -> bool:
+        del max_attempts  # attempt budget is always read from the task itself
+        return self.recover_task(task_id, reason=reason, now=now, force=force)
+
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> Event:
         return Event(
-            seq=int(row["seq"]),
+            seq=int(row["run_seq"]),
             event_id=row["event_id"],
             project_id=row["project_id"],
             type=EventType(row["type"]),
@@ -716,7 +831,13 @@ class Store:
     def _proj_task_unblocked(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
         self._mutate_task(
-            conn, event.task_id, event, status=TaskStatus.READY, blocked_reason=None
+            conn,
+            event.task_id,
+            event,
+            status=TaskStatus.READY,
+            blocked_reason=None,
+            failure_reason=None,
+            finished_at=None,
         )
 
     def _proj_task_retried(self, conn: sqlite3.Connection, event: Event) -> None:
@@ -729,7 +850,11 @@ class Store:
             blocked_reason=None,
             failure_reason=None,
             owner=None,
+            claimed_at=None,
             lease_expires_at=None,
+            # FIND-004: a re-dispatched task is in flight again; started/finished
+            # must bracket the *current* attempt, never the dead one.
+            finished_at=None,
         )
 
     def _proj_task_rework(self, conn: sqlite3.Connection, event: Event) -> None:
@@ -746,6 +871,7 @@ class Store:
             rework_count=task.rework_count + 1,
             owner=None,
             lease_expires_at=None,
+            finished_at=None,
         )
 
     def _proj_task_split(self, conn: sqlite3.Connection, event: Event) -> None:
@@ -831,10 +957,12 @@ class Store:
     def _proj_agent_run_finished(self, conn: sqlite3.Connection, event: Event) -> None:
         run = AgentRun.model_validate(event.payload["run"])
         if run.task_id and run.finished_at is not None:
-            task = self._load_task(conn, run.task_id)
-            if task.status is TaskStatus.RUNNING:
-                # A finished agent call is the canonical progress signal.
-                self._mutate_task(conn, run.task_id, event, progress_at=event.created_at)
+            row = conn.execute("SELECT data FROM tasks WHERE id=?", (run.task_id,)).fetchone()
+            if row is not None:
+                task = Task.model_validate(json.loads(row["data"]))
+                if task.status is TaskStatus.RUNNING:
+                    # A finished agent call is the canonical progress signal.
+                    self._mutate_task(conn, run.task_id, event, progress_at=event.created_at)
         conn.execute(
             "UPDATE runs SET ok=?, error_type=?, tokens_in=?, tokens_out=?, calls=?, cost_usd=?,"
             " duration_s=?, finished_at=?, data=? WHERE id=?",
@@ -1074,6 +1202,24 @@ class Store:
         with self._lock:
             row = self._conn.execute(
                 "SELECT data FROM derived WHERE project_id=? AND key=?",
+                (project_id, key),
+            ).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def put_control(self, project_id: str, key: str, data: dict[str, Any]) -> None:
+        """Record an out-of-band control signal (e.g. a cancel request)."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO control (project_id, key, data, updated_at) VALUES (?,?,?,?)"
+                " ON CONFLICT(project_id, key) DO UPDATE SET data=excluded.data,"
+                " updated_at=excluded.updated_at",
+                (project_id, key, json.dumps(data, default=str), utcnow().isoformat()),
+            )
+
+    def get_control(self, project_id: str, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM control WHERE project_id=? AND key=?",
                 (project_id, key),
             ).fetchone()
         return json.loads(row["data"]) if row else None
@@ -1369,9 +1515,10 @@ class Store:
         for run in self.unfinished_runs(project_id):
             problems.append(f"run {run.id} (task {run.task_id}) started but never finished")
         seqs = self.event_seqs(project_id)
-        for previous, current in zip(seqs, seqs[1:], strict=False):
-            if current != previous + 1:
-                problems.append(f"event seq gap: {previous} -> {current}")
+        if seqs and seqs != list(range(seqs[0], seqs[0] + len(seqs))):
+            problems.append(
+                f"event seq gap: {len(seqs)} events from {seqs[0]} to {seqs[-1]} are not contiguous"
+            )
         budget_doc = self.get_document(project_id, "budget")
         if budget_doc is None:
             problems.append("no budget snapshot recorded")
