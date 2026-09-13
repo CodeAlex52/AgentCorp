@@ -41,6 +41,7 @@ from agentcorp import (
 )
 from agentcorp.runtime import AgentRuntime, usage_from_exception
 from agentcorp.util import FakeClock
+from agentcorp.worker import _write_file
 
 # ---------------------------------------------------------------------------
 # FIND-001 — failed attempts must be billed
@@ -407,16 +408,22 @@ def test_finding_011_vcs_metadata_is_rejected_case_insensitively(tmp_path: Path,
     assert (root / ".git" / "config").read_text(encoding="utf-8") == "ORIGINAL"
 
 
-def test_finding_013_hardlink_inside_the_root_is_refused(tmp_path: Path) -> None:
+def test_finding_013_hardlink_inside_the_root_cannot_reach_outside(tmp_path: Path) -> None:
+    """Alias-aware: the in-root write must not modify the outside inode."""
     outside = tmp_path / "outside_secret.txt"
     outside.write_text("CLASSIFIED", encoding="utf-8")
     root = tmp_path / "repo"
     root.mkdir()
     link = root / "notes.md"
     os.link(outside, link)  # a repository can carry this
-    with pytest.raises(PathViolationError, match="hard link"):
-        validate_write_path("notes.md", root)
-    assert outside.read_text(encoding="utf-8") == "CLASSIFIED"
+
+    target = validate_write_path("notes.md", root)  # the path itself is inside the root
+    _write_file(target, "task output", mode="write")
+
+    assert outside.read_text(encoding="utf-8") == "CLASSIFIED", (
+        "writing the in-root hard link modified the out-of-root inode"
+    )
+    assert (root / "notes.md").read_text(encoding="utf-8") == "task output"
 
 
 def test_finding_013_symlink_escape_is_still_refused(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ adversarial review explicitly checks.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -278,6 +279,13 @@ def _coerce_messages(messages: Sequence[Message | dict[str, str]]) -> list[Messa
     return out
 
 
+#: Some transports report billing in the error text instead of a structured
+#: field ("provider billed 500 tokens then timed out").  Reading it is a last
+#: resort so a paid-for-but-failed call can never be accounted as free
+#: (DEC-019).  Structured usage always wins when present.
+_BILLED_TOKENS_RE = re.compile(r"billed\s+(\d+)\s+tokens?", re.IGNORECASE)
+
+
 def usage_from_exception(exc: BaseException, *, fallback_tokens: int = 0) -> Usage:
     """Usage a failed attempt should be billed for (C7, FIND-001).
 
@@ -287,7 +295,8 @@ def usage_from_exception(exc: BaseException, *, fallback_tokens: int = 0) -> Usa
        what they spent before failing (:class:`~agentcorp.errors.ProviderBilledError`);
     2. ``exc.tokens`` — the shape :class:`~agentcorp.errors.ContextOverflowError`
        already carries;
-    3. the pre-flight prompt estimate — "dispatched but not reported" is billed
+    3. a ``billed <N> tokens`` report in the exception text;
+    4. the pre-flight prompt estimate — "dispatched but not reported" is billed
        pessimistically rather than free.
     """
     raw = getattr(exc, "usage", None)
@@ -308,6 +317,9 @@ def usage_from_exception(exc: BaseException, *, fallback_tokens: int = 0) -> Usa
     tokens = getattr(exc, "tokens", None)
     if isinstance(tokens, int) and tokens > 0:
         return Usage(tokens_in=tokens, calls=1)
+    match = _BILLED_TOKENS_RE.search(str(exc))
+    if match:
+        return Usage(tokens_in=int(match.group(1)), calls=1)
     return Usage(tokens_in=max(fallback_tokens, 0), calls=1)
 
 

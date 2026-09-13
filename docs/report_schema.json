@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "agent_calls": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "cost_usd": {
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "critical_path": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "events_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "files_changed": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "finished_at": {
+      "type": "string"
+    },
+    "interventions": {
+      "properties": {
+        "false_positive_guarded": {
+          "type": "boolean"
+        },
+        "total": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "false_positive_guarded"
+      ],
+      "type": "object"
+    },
+    "per_task": {
+      "items": {
+        "properties": {
+          "attempts": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "duration_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "review_rejected": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "tokens": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "task_id",
+          "kind",
+          "status",
+          "attempts",
+          "tokens",
+          "duration_ms",
+          "review_rejected"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "retries": {
+      "properties": {
+        "by_task": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "total": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "by_task"
+      ],
+      "type": "object"
+    },
+    "reviews": {
+      "properties": {
+        "rejected": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rework_rounds": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "rejected",
+        "rework_rounds"
+      ],
+      "type": "object"
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1",
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "DONE",
+        "FAILED",
+        "BUDGET_EXHAUSTED",
+        "CANCELLED",
+        "DEADLOCK"
+      ],
+      "type": "string"
+    },
+    "success_rate": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "tasks": {
+      "properties": {
+        "cancelled": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "done": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_depth": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "quarantined": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "split_parents": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "done",
+        "failed",
+        "cancelled",
+        "quarantined",
+        "split_parents",
+        "max_depth"
+      ],
+      "type": "object"
+    },
+    "tokens": {
+      "properties": {
+        "budget_limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pressure": {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "total": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input",
+        "output",
+        "total",
+        "budget_limit",
+        "pressure"
+      ],
+      "type": "object"
+    },
+    "wall_ms": {
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "run_id",
+    "status",
+    "started_at",
+    "finished_at",
+    "wall_ms",
+    "tasks",
+    "success_rate",
+    "agent_calls",
+    "tokens",
+    "cost_usd",
+    "retries",
+    "reviews",
+    "interventions",
+    "files_changed",
+    "events_count",
+    "critical_path",
+    "per_task"
+  ],
+  "title": "AgentCorp run report (SPEC v0 \u00a76)",
+  "type": "object"
+}

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 import networkx as nx
 
 from .errors import GraphError
-from .models import TERMINAL_STATUSES, Task, TaskKind, TaskStatus
+from .models import TERMINAL_STATUSES, Task, TaskKind, TaskStatus, can_never_complete
 
 __all__ = ["TaskGraph", "GraphStats", "STATUS_GLYPH"]
 
@@ -31,7 +31,9 @@ STATUS_GLYPH: dict[TaskStatus, str] = {
     TaskStatus.CANCELLED: "×",
 }
 
-#: Statuses that make a dependent permanently unrunnable.
+#: Statuses that *may* make a dependent permanently unrunnable.  A FAILED task
+#: is only poison once its attempt budget is exhausted — a retryable failure
+#: must not cancel its dependents (AC-05 P1-C / FIND-003 mechanism).
 POISON_STATUSES: frozenset[TaskStatus] = frozenset(
     {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.QUARANTINED}
 )
@@ -245,7 +247,7 @@ class TaskGraph:
             dead = [
                 d
                 for d in task.dependencies
-                if (self._tasks.get(d) is None) or self._tasks[d].status in POISON_STATUSES
+                if (self._tasks.get(d) is None) or can_never_complete(self._tasks[d])
             ]
             missing = [d for d in task.dependencies if d not in self._tasks]
             if dead or missing:

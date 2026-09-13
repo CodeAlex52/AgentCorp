@@ -68,4 +68,6 @@ ignore = ["E501"]
 # Test / example files legitimately abuse unused fixture arguments and locals.
 "tests/*" = ["ARG001", "ARG002", "ARG005", "F841", "B011"]
 "examples/*" = ["ARG001", "T201", "PTH"]
+# demo_repo is the *target* of the demo run, intentionally plain code.
+"examples/demo_repo/*" = ["UP046", "UP047", "C4", "SIM", "PTH", "E501", "F401"]
 "scripts/*" = ["T201"]

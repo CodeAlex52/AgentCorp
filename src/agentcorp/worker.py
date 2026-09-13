@@ -185,11 +185,7 @@ class Worker:
                 raise PathViolationError(msg)
             if self.apply_writes:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if write.mode == "append" and target.exists():
-                    with target.open("a", encoding="utf-8") as handle:
-                        handle.write(write.content)
-                else:
-                    target.write_text(write.content, encoding="utf-8")
+                _write_file(target, write.content, mode=write.mode)
             written.append(rel)
             artifacts.append(
                 Artifact(
@@ -303,20 +299,12 @@ def validate_write_path(
     if resolved.exists() and resolved.is_dir():
         raise PathViolationError(f"path is a directory: {path!r}")
     if resolved.exists():
-        # Hard links are indistinguishable from normal files by path alone: a
-        # repository can carry one that aliases a file outside the sandbox, so
-        # any inode with more than one name is refused (FIND-013, DEC-017).
         try:
             info = os.lstat(resolved)
         except OSError as exc:  # pragma: no cover - raced deletion
             raise PathViolationError(f"cannot stat {path!r}: {exc}") from exc
-        if not stat.S_ISREG(info.st_mode) and not stat.S_ISFIFO(info.st_mode):
+        if not stat.S_ISREG(info.st_mode):
             raise PathViolationError(f"refusing to write through {path!r}: not a regular file")
-        if info.st_nlink > 1:
-            raise PathViolationError(
-                f"refusing to write through {path!r}: hard link (nlink={info.st_nlink}) "
-                "may alias a file outside the repository"
-            )
 
     if strict_touch and touch_paths:
         allowed = [_normalise_touch(t) for t in touch_paths]
@@ -325,6 +313,29 @@ def validate_write_path(
                 f"path {path!r} is outside the task's declared touch_paths {sorted(allowed)}"
             )
     return resolved
+
+
+def _write_file(target: Path, content: str, *, mode: str) -> None:
+    """Write ``content`` at ``target`` without ever writing *through* an alias.
+
+    A hard link inside the repository can share its inode with a file outside
+    it; writing in place would then modify that outside file (FIND-013).  The
+    link is therefore broken first (unlink + create), which keeps the task's
+    change inside the sandbox and leaves every other name of the old inode
+    untouched.  Append semantics are preserved on a private copy of the file.
+    """
+    existing: str | None = None
+    if target.exists():
+        info = os.lstat(target)
+        if info.st_nlink > 1:
+            if mode == "append":
+                existing = target.read_text(encoding="utf-8", errors="replace")
+            target.unlink()
+    if mode == "append" and target.exists():
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(content)
+        return
+    target.write_text((existing or "") + content, encoding="utf-8")
 
 
 def _normalise_touch(path: str) -> str:

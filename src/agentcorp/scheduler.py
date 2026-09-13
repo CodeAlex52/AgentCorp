@@ -47,6 +47,7 @@ from .models import (
     Task,
     TaskStatus,
     WorkerOutcome,
+    can_never_complete,
 )
 from .prompts import review_to_repair_hint
 from .reviewer import Reviewer, validate_review
@@ -315,11 +316,7 @@ class Scheduler:
                 if dep is None:
                     dead = f"{dep_id}:missing"
                     break
-                if dep.status in {
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                    TaskStatus.QUARANTINED,
-                }:
+                if can_never_complete(dep):
                     dead = f"{dep_id}:{dep.status.value}"
                     break
             self._emit(
@@ -371,11 +368,17 @@ class Scheduler:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         for task_id, fut in list(self._inflight.items()):
-            if fut.done():
-                exc = fut.exception()
-                if exc is not None:  # pragma: no cover - defensive
-                    log.error("task %s coroutine crashed: %r", task_id, exc)
-                self._inflight.pop(task_id, None)
+            if not fut.done():
+                continue
+            self._inflight.pop(task_id, None)
+            if fut.cancelled():
+                # `Task.exception()` re-raises CancelledError; a cancelled
+                # in-flight call is expected during stop/cancel and must not
+                # take the scheduler down with it (AC-05 P0-B).
+                continue
+            exc = fut.exception()
+            if exc is not None:  # pragma: no cover - defensive
+                log.error("task %s coroutine crashed: %r", task_id, exc)
         self._maybe_abort_inflight()
 
     async def _guarded_execute(self, task_id: str) -> None:
@@ -548,7 +551,32 @@ class Scheduler:
         await self._insert_children(task, plan.children, plan.reason)
 
     async def _insert_children(self, parent: Task, children: list[Task], reason: str) -> None:
-        """Validate the candidate DAG and insert parent+children atomically (C8)."""
+        """Validate the candidate DAG and insert parent+children atomically (C8).
+
+        Bounds are re-checked here, against the *current* graph, because the
+        decomposer's own check used a snapshot taken before its (awaited)
+        provider call: two splits that were in flight together would otherwise
+        both land and breach ``max_total_tasks`` (AC-05 P2-1).
+        """
+        total_now = len(self.graph.tasks)
+        if total_now + len(children) > self.decomposer.bounds.max_total_tasks:
+            await self._fail_task(
+                parent.id,
+                (
+                    f"split refused at insert time: {total_now} existing + "
+                    f"{len(children)} children exceeds max_total_tasks "
+                    f"{self.decomposer.bounds.max_total_tasks}"
+                ),
+                retryable=False,
+            )
+            return
+        if parent.depth + 1 > self.decomposer.bounds.max_depth:
+            await self._fail_task(
+                parent.id,
+                f"split refused at insert time: depth {parent.depth + 1} exceeds max_depth",
+                retryable=False,
+            )
+            return
         copies = {t.id: t.model_copy(deep=True) for t in self.graph.tasks}
         scratch = TaskGraph(list(copies.values()))
         for child in children:
@@ -658,8 +686,15 @@ class Scheduler:
             project_id=self.project_id,
             budget_pressure=self.budget.pressure(),
         )
+        handled = {
+            intervention.finding.task_ids[0]
+            for intervention in interventions
+            if intervention.finding.task_ids
+            and intervention.kind in {InterventionKind.SPLIT, InterventionKind.CANCEL}
+        }
         for intervention in interventions:
             await self._apply_intervention(intervention)
+        await self._enforce_liveness(handled)
 
     async def _apply_intervention(self, intervention: Intervention) -> None:
         task_id = intervention.finding.task_ids[0] if intervention.finding.task_ids else None
@@ -734,6 +769,46 @@ class Scheduler:
             retryable=True,
         )
         return True
+
+    async def _enforce_liveness(self, handled: set[str]) -> None:
+        """Hard liveness backstop (AC-05 P1-3).
+
+        The supervisor stops intervening once ``max_interventions_per_task`` is
+        reached, but a provider that hangs forever would leave the run waiting
+        forever.  Any task that is provably making no progress and was not
+        handled this tick is therefore aborted and failed — attempt accounting
+        (not an unbounded retry loop) decides whether it retries or is
+        quarantined, so the run always converges.
+        """
+        for task_id in self.supervisor.stuck_task_ids(self.graph):
+            if task_id in handled:
+                continue
+            task = self._task(task_id)
+            if task is None or task.status is not TaskStatus.RUNNING:
+                continue
+            self._emit(
+                EventType.NOTE,
+                task_id,
+                {
+                    "stage": "liveness",
+                    "summary": (
+                        f"liveness backstop: {task_id} made no progress and no "
+                        "supervisor intervention is available; aborting the attempt"
+                    ),
+                    "attempts": task.attempts,
+                },
+            )
+            self._abort_silently.add(task_id)
+            await self._abort(task_id)
+            self._abort_silently.discard(task_id)
+            refreshed = self._task(task_id)
+            if refreshed is None or refreshed.status is not TaskStatus.RUNNING:
+                continue
+            await self._fail_task(
+                task_id,
+                "liveness backstop: provider call produced no progress",
+                retryable=True,
+            )
 
     async def _abort(self, task_id: str) -> None:
         fut = self._inflight.pop(task_id, None)

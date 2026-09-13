@@ -26,6 +26,7 @@ __all__ = [
     "ALLOWED_TRANSITIONS",
     "transition_allowed",
     "assert_transition",
+    "can_never_complete",
     "AcceptanceCriterion",
     "Task",
     "Requirement",
@@ -125,6 +126,20 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
 ATTEMPT_GUARDED_TRANSITIONS: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
     {(TaskStatus.FAILED, TaskStatus.READY)}
 )
+
+
+def can_never_complete(task: Task) -> bool:
+    """True when ``task`` can never reach ``DONE`` (a *permanent* poison).
+
+    ``FAILED`` is deliberately **not** poison while attempts remain: the task
+    will be retried and its dependents must wait, not be cancelled (AC-05
+    P1-C).  Only exhausted FAILED, QUARANTINED and CANCELLED block successors.
+    """
+    if task.status is TaskStatus.CANCELLED or task.status is TaskStatus.QUARANTINED:
+        return True
+    if task.status is TaskStatus.FAILED:
+        return task.attempts >= task.max_attempts
+    return False
 
 
 def transition_allowed(current: TaskStatus, target: TaskStatus) -> bool:

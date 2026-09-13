@@ -55,8 +55,11 @@ class SupervisorStats:
     applied: int = 0
     findings_by_kind: dict[str, int] = field(default_factory=dict)
     #: Times the naive elapsed-time heuristic would have fired but the task was
-    #: provably making progress.
+    #: provably making progress (the guard doing its job).
     false_positive_guarded: int = 0
+    #: Interventions raised against a task that *was* progressing.  Structurally
+    #: 0; the report asserts it rather than hardcoding a happy answer (F13).
+    false_positives: int = 0
 
 
 @dataclass
@@ -198,6 +201,28 @@ class Supervisor:
         out.extend(self._failure_interventions(graph, project_id, now))
         out.extend(self._drift_interventions(graph, now))
         self.stats.raised += len(out)
+        return out
+
+    def stuck_task_ids(self, graph: TaskGraph) -> list[str]:
+        """RUNNING tasks that have made no progress for ``stuck_after_s``.
+
+        Unlike :meth:`tick` this ignores the intervention budget/cooldown: it is
+        the scheduler's liveness backstop input (AC-05 P1-3), so a hung provider
+        can never leave the run waiting after the supervisor stops intervening.
+        """
+        now = self.clock.monotonic()
+        out: list[str] = []
+        for task in sorted(graph.tasks, key=lambda t: t.id):
+            if task.status is not TaskStatus.RUNNING:
+                continue
+            trace = self._traces.get(task.id)
+            if trace is None:
+                self.seed_from_task(task)
+                trace = self._traces.get(task.id)
+            if trace is None:  # pragma: no cover - defensive
+                continue
+            if now - trace.last_progress_monotonic >= self.config.stuck_after_s:
+                out.append(task.id)
         return out
 
     def report_idle(
@@ -355,6 +380,7 @@ class Supervisor:
             "applied": self.stats.applied,
             "by_kind": dict(self.stats.findings_by_kind),
             "false_positive_guarded": len(self._guarded),
+            "false_positives": self.stats.false_positives,
             "guarded_tasks": sorted(self._guarded),
             "tracked_tasks": len(self._traces),
         }
