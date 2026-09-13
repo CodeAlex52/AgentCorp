@@ -14,7 +14,7 @@ import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, TypeVar
+from typing import Any
 
 from .errors import CircuitOpenError, RateLimitError, is_retryable
 from .util import Clock, Sleeper, SystemClock, system_sleep
@@ -28,8 +28,6 @@ __all__ = [
     "TokenBucket",
     "CircuitStats",
 ]
-
-T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -80,7 +78,7 @@ class RetryOutcome:
         return not self.recovered
 
 
-async def call_with_retry(
+async def call_with_retry[T](
     fn: Callable[[int], Awaitable[T]],
     policy: RetryPolicy | None = None,
     *,
@@ -109,9 +107,9 @@ async def call_with_retry(
             last_error = exc
             book.errors.append(f"{type(exc).__name__}: {exc}")
             retryable = retry_on(exc)
-            if on_attempt is not None:
-                on_attempt(attempt, exc, 0.0)
             if not retryable or attempt >= policy.max_attempts:
+                if on_attempt is not None:
+                    on_attempt(attempt, exc, 0.0)
                 raise
             delay = policy.delay_for(attempt, rng)
             if policy.respect_retry_after and isinstance(exc, RateLimitError) and exc.retry_after:
@@ -120,6 +118,8 @@ async def call_with_retry(
                 delay = max(delay, float(exc.retry_after))
             delay = min(delay, policy.max_delay)
             book.delays.append(delay)
+            # Exactly one callback per failed attempt, carrying the real delay
+            # (the baseline fired twice, duplicating every retry NOTE event).
             if on_attempt is not None:
                 on_attempt(attempt, exc, delay)
             await sleep(delay)
@@ -194,10 +194,13 @@ class CircuitBreaker:
             return self._state
 
     def _maybe_half_open(self) -> None:
-        if self._state is CircuitState.OPEN and self._opened_at is not None:
-            if self.clock.monotonic() - self._opened_at >= self.reset_timeout:
-                self._state = CircuitState.HALF_OPEN
-                self._half_open_in_flight = 0
+        if (
+            self._state is CircuitState.OPEN
+            and self._opened_at is not None
+            and self.clock.monotonic() - self._opened_at >= self.reset_timeout
+        ):
+            self._state = CircuitState.HALF_OPEN
+            self._half_open_in_flight = 0
 
     def time_until_available(self) -> float:
         with self._lock:

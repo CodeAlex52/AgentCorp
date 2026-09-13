@@ -98,7 +98,7 @@ class AgentProvider(abc.ABC):
 
     async def aclose(self) -> None:
         """Release transport resources. Overridden by HTTP providers."""
-        return None
+        return
 
     def cost_of(self, tokens_in: int, tokens_out: int) -> float:
         pin, pout = self.pricing

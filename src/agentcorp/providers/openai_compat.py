@@ -185,8 +185,8 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
     except ValueError:
         pass
     try:
-        from email.utils import parsedate_to_datetime
         from datetime import UTC, datetime
+        from email.utils import parsedate_to_datetime
 
         when = parsedate_to_datetime(raw)
         if when.tzinfo is None:

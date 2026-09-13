@@ -20,10 +20,10 @@ import random
 import re
 from collections.abc import Callable, Sequence
 
-from ..errors import ContextOverflowError, RateLimitError, SchemaError, TimeoutError_
-from ..models import FileWrite, Usage
+from ..errors import ContextOverflowError, RateLimitError, TimeoutError_
+from ..models import Usage
 from ..util import Clock, SystemClock
-from .base import AgentProvider, CompletionRequest, CompletionResponse, estimate_tokens, Message
+from .base import AgentProvider, CompletionRequest, CompletionResponse, estimate_tokens
 
 __all__ = ["MockProvider", "Behavior"]
 
@@ -66,6 +66,7 @@ class MockProvider(AgentProvider):
         clock: Clock | None = None,
         context_window: int | None = None,
         rng: random.Random | None = None,
+        max_subtasks: int = 5,
     ) -> None:
         self.skill = skill
         self.seed = seed
@@ -73,6 +74,7 @@ class MockProvider(AgentProvider):
         self.script = script
         self.clock = clock or SystemClock()
         self.context_window = context_window
+        self.max_subtasks = max(max_subtasks, 1)
         self._rng = rng or random.Random(seed)
         self.calls: list[CompletionRequest] = []
         self.responses: list[str] = []
@@ -144,6 +146,7 @@ class MockProvider(AgentProvider):
             "worker": self._worker,
             "reviewer": self._review,
             "review": self._review,
+            "decomposer": self._decompose,
         }.get(contract, self._worker)
         return handler(request)
 
@@ -160,7 +163,7 @@ class MockProvider(AgentProvider):
             word in title.lower() for word in ("investigate", "research", "analyze", "analyse", "explore")
         )
         if wants_investigation or not touch:
-            body = {
+            body: dict[str, object] = {
                 "status": "success",
                 "summary": f"Investigated: {title}. Found the relevant modules and described "
                 "how they interact; no code changes required for this investigation task.",
@@ -173,7 +176,7 @@ class MockProvider(AgentProvider):
             }
             return json.dumps(body, indent=2)
 
-        files = []
+        files: list[dict[str, str]] = []
         for path in touch:
             files.append({"path": path, "content": self._file_body(path, title), "mode": "write"})
         body = {
@@ -188,7 +191,7 @@ class MockProvider(AgentProvider):
 
     def _blocked_worker(self, request: CompletionRequest, why: str) -> str:
         title = self._title(request)
-        body = {
+        body: dict[str, object] = {
             "status": "blocked",
             "summary": f"Cannot complete '{title}' as one unit.",
             "reason": f"mock:{why} — the objective spans several independent concerns",
@@ -233,7 +236,7 @@ class MockProvider(AgentProvider):
         return json.dumps(body, indent=2)
 
     # ----------------------------------------------------------------- planner
-    def _plan(self, request: CompletionRequest) -> str:
+    def _plan(self, request: CompletionRequest) -> str:  # noqa: ARG002 - handler signature is uniform across contracts
         """Emit a small but structurally valid DAG for the mock repository."""
         titles = [
             ("Investigate current structure", "research", []),
@@ -273,6 +276,55 @@ class MockProvider(AgentProvider):
                 "acceptance_criteria": [
                     {"statement": "the requested behaviour is implemented", "verification": "review"}
                 ],
+                "keywords": _keywords(text),
+            },
+            indent=2,
+        )
+
+    # -------------------------------------------------------------- decomposer
+    def _decompose(self, request: CompletionRequest) -> str:
+        """Deterministic SPLIT decision for the decomposer contract.
+
+        The baseline had no decomposer handler, so this prompt fell through to
+        the worker handler and always failed to parse (BASELINE_AUDIT DEF-09).
+        """
+        text = request.text()
+        title = self._title(request)
+        objectives: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip(" -•\t")
+            if stripped.lower().startswith(("define ", "implement ", "test ")):
+                objectives.append(stripped)
+        if not objectives:
+            objectives = [
+                f"Define the interface for {title}",
+                f"Implement {title} against the interface",
+                f"Test {title} end to end",
+            ]
+        subtasks: list[dict[str, object]] = []
+        for index, objective in enumerate(objectives[: self.max_subtasks]):
+            subtasks.append(
+                {
+                    "title": objective[:80],
+                    "objective": objective,
+                    "kind": "implementation" if index == 1 else ("test" if index >= 2 else "research"),
+                    "depends_on_siblings": [index - 1] if index > 0 else [],
+                    "acceptance_criteria": [
+                        {"statement": f"{objective} is complete and checkable", "verification": "review"}
+                    ],
+                    "touch_paths": [],
+                }
+            )
+        # The parent's touch paths spread across the actionable children so the
+        # split does not silently drop the write scope.
+        touches = self._touch_paths(request)
+        if touches and subtasks:
+            subtasks[min(1, len(subtasks) - 1)]["touch_paths"] = touches
+        return json.dumps(
+            {
+                "should_split": True,
+                "reason": "deterministic mock split: the objective spans several concerns",
+                "subtasks": subtasks,
             },
             indent=2,
         )
@@ -326,6 +378,23 @@ class MockProvider(AgentProvider):
 def _slug(text: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", text.strip().lower()).strip("_")
     return cleaned or "generated_symbol"
+
+
+_STOPWORDS = frozenset(
+    {"the", "and", "for", "with", "that", "this", "into", "from", "must", "should", "will",
+     "task", "your", "you", "are", "not", "all", "any", "its", "their", "then", "than"}
+)
+
+
+def _keywords(text: str) -> list[str]:
+    """Salient lowercase terms, used for requirement 'vocabulary coverage' checks."""
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text.lower())
+    seen: list[str] = []
+    for word in words:
+        if word in _STOPWORDS or word in seen:
+            continue
+        seen.append(word)
+    return seen[:20]
 
 
 class FlakyProvider(MockProvider):

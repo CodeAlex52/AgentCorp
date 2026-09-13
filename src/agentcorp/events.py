@@ -21,6 +21,11 @@ __all__ = ["EventType", "Event", "PROJECTION_EVENTS", "EventEmitter", "NullEmitt
 
 
 class EventType(StrEnum):
+    # --- run lifecycle (SPEC §5.4) -----------------------------------------
+    RUN_STARTED = "RUN_STARTED"
+    RUN_FINISHED = "RUN_FINISHED"
+    RUN_RESUMED = "RUN_RESUMED"
+
     # --- project lifecycle -------------------------------------------------
     PROJECT_CREATED = "PROJECT_CREATED"
     PROJECT_PAUSED = "PROJECT_PAUSED"
@@ -37,13 +42,18 @@ class EventType(StrEnum):
 
     # --- execution ---------------------------------------------------------
     TASK_READY = "TASK_READY"
+    TASK_CLAIMED = "TASK_CLAIMED"
     TASK_STARTED = "TASK_STARTED"
+    TASK_FINISHED = "TASK_FINISHED"  # SPEC name; TASK_COMPLETED kept as alias
     TASK_COMPLETED = "TASK_COMPLETED"
     TASK_FAILED = "TASK_FAILED"
     TASK_BLOCKED = "TASK_BLOCKED"
     TASK_UNBLOCKED = "TASK_UNBLOCKED"
     TASK_SPLIT = "TASK_SPLIT"
+    TASK_AGGREGATED = "TASK_AGGREGATED"
     TASK_RETRIED = "TASK_RETRIED"
+    TASK_REWORK = "TASK_REWORK"
+    TASK_QUARANTINED = "TASK_QUARANTINED"
     TASK_CANCELLED = "TASK_CANCELLED"
 
     # --- agents ------------------------------------------------------------
@@ -53,16 +63,28 @@ class EventType(StrEnum):
     CHAOS_INJECTED = "CHAOS_INJECTED"
 
     # --- review ------------------------------------------------------------
+    REVIEW_STARTED = "REVIEW_STARTED"
+    REVIEW_APPROVED = "REVIEW_APPROVED"
+    REVIEW_REJECTED = "REVIEW_REJECTED"
+    #: Baseline names, kept so pre-existing logs keep projecting.
     REVIEW_PASSED = "REVIEW_PASSED"
     REVIEW_FAILED = "REVIEW_FAILED"
 
     # --- budget ------------------------------------------------------------
     BUDGET_UPDATED = "BUDGET_UPDATED"
-    BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
-
+    BUDGET_WARNING = "BUDGET_WARNING"
+    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"  # SPEC name
+    BUDGET_EXCEEDED = "BUDGET_EXCEEDED"  # baseline alias
     # --- supervision -------------------------------------------------------
     SUPERVISOR_TICK = "SUPERVISOR_TICK"
     SUPERVISOR_INTERVENTION = "SUPERVISOR_INTERVENTION"
+    INTERVENTION_RAISED = "INTERVENTION_RAISED"
+    INTERVENTION_APPLIED = "INTERVENTION_APPLIED"
+
+    # --- structural failures ----------------------------------------------
+    CYCLE_DETECTED = "CYCLE_DETECTED"
+    DEADLOCK_DETECTED = "DEADLOCK_DETECTED"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
 
     # --- misc --------------------------------------------------------------
     ARTIFACT_PRODUCED = "ARTIFACT_PRODUCED"
@@ -77,15 +99,30 @@ PROJECTION_EVENTS: frozenset[EventType] = frozenset(
         EventType.TASK_CREATED,
         EventType.TASK_UPDATED,
         EventType.TASK_READY,
+        EventType.TASK_CLAIMED,
         EventType.TASK_STARTED,
+        EventType.TASK_FINISHED,
         EventType.TASK_COMPLETED,
         EventType.TASK_FAILED,
         EventType.TASK_BLOCKED,
         EventType.TASK_UNBLOCKED,
         EventType.TASK_SPLIT,
+        EventType.TASK_AGGREGATED,
         EventType.TASK_RETRIED,
+        EventType.TASK_REWORK,
+        EventType.TASK_QUARANTINED,
         EventType.TASK_CANCELLED,
+        EventType.REVIEW_STARTED,
+        EventType.REVIEW_APPROVED,
+        EventType.REVIEW_REJECTED,
+        EventType.REVIEW_PASSED,
+        EventType.REVIEW_FAILED,
     }
+)
+
+#: Events whose projection must never be skipped while replaying.
+TASK_LIFECYCLE_EVENTS: frozenset[EventType] = frozenset(
+    e for e in PROJECTION_EVENTS if e.value.startswith("TASK_")
 )
 
 
@@ -134,7 +171,7 @@ EventEmitter = Callable[[EventType, str | None, dict[str, Any]], None]
 
 def NullEmitter(_type: EventType, _task_id: str | None, _payload: dict[str, Any]) -> None:
     """Emitter for unit tests and for projecting a replay without writing."""
-    return None
+    return
 
 
 class RecordingEmitter:

@@ -21,12 +21,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .budget import BudgetManager
-from .errors import ContextOverflowError
+from .errors import ContextOverflowError, TransientError
 from .events import EventEmitter, EventType
 from .models import AgentRun, Usage
 from .providers.base import AgentProvider, CompletionRequest, Message, estimate_tokens
 from .reliability import CircuitBreaker, RetryOutcome, RetryPolicy, TokenBucket, call_with_retry
-from .util import Clock, SystemClock, Sleeper, content_hash, system_sleep
+from .util import Clock, Sleeper, SystemClock, content_hash, system_sleep
 
 __all__ = ["AgentRuntime", "RuntimeResult", "RunRecorder"]
 
@@ -120,7 +120,7 @@ class AgentRuntime:
             task_id=task_id,
             role=role,
             provider=getattr(self.provider, "name", "unknown"),
-            model=model or getattr(self.provider, "default_model", "unknown"),
+            model=model or str(getattr(self.provider, "default_model", "unknown")),
             prompt=request.text(),
             request_hash=content_hash(request.text()),
             started_at=self.clock.now(),
@@ -143,19 +143,29 @@ class AgentRuntime:
                 await self.rate_limiter.acquire(sleep=self.sleep)
             try:
                 response = await self.provider.complete(request)
-            except ContextOverflowError:
+            except ContextOverflowError as exc:
                 # Shrink the largest user message and retry — but only a couple
-                # of times, then let the error surface to the caller.
+                # of times, then let the error surface to the caller.  The
+                # shrink must re-raise something *retryable*: the taxonomy marks
+                # ContextOverflowError non-retryable precisely because
+                # retrying it unchanged is pointless (BASELINE_AUDIT DEF-03).
                 if shrinks >= self.max_context_shrinks:
                     raise
                 shrinks += 1
                 request.messages = _shrink_largest(request.messages)
                 recovered.append(f"context_overflow_shrink_{shrinks}")
-                raise
+                msg = (
+                    f"context overflow ({exc}); context shrunk to fit, retrying "
+                    f"with {len(request.messages)} message(s)"
+                )
+                raise TransientError(msg) from exc
             run.usage = response.usage
             run.response = response.text
             run.response_hash = content_hash(response.text)
             run.model = response.model
+            chaos = response.raw.get("chaos") if isinstance(response.raw, dict) else None
+            if chaos:
+                run.chaos_injections = [*run.chaos_injections, str(chaos)]
             return response.text
 
         try:
@@ -251,7 +261,9 @@ class AgentRuntime:
 def _coerce_messages(messages: Sequence[Message | dict[str, str]]) -> list[Message]:
     out: list[Message] = []
     for message in messages:
-        out.append(message if isinstance(message, Message) else Message(**message))
+        out.append(
+            message if isinstance(message, Message) else Message.model_validate(message)
+        )
     return out
 
 

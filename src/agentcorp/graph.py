@@ -14,23 +14,26 @@ from dataclasses import dataclass, field
 import networkx as nx
 
 from .errors import GraphError
-from .models import Task, TaskKind, TaskStatus
+from .models import TERMINAL_STATUSES, Task, TaskKind, TaskStatus
 
 __all__ = ["TaskGraph", "GraphStats", "STATUS_GLYPH"]
 
 STATUS_GLYPH: dict[TaskStatus, str] = {
     TaskStatus.PENDING: "○",
+    TaskStatus.READY: "◔",
     TaskStatus.RUNNING: "◐",
+    TaskStatus.REVIEW: "◎",
     TaskStatus.BLOCKED: "⊘",
     TaskStatus.FAILED: "✗",
     TaskStatus.DONE: "●",
     TaskStatus.SPLIT: "⑂",
+    TaskStatus.QUARANTINED: "⚿",
     TaskStatus.CANCELLED: "×",
 }
 
 #: Statuses that make a dependent permanently unrunnable.
 POISON_STATUSES: frozenset[TaskStatus] = frozenset(
-    {TaskStatus.FAILED, TaskStatus.CANCELLED}
+    {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.QUARANTINED}
 )
 
 
@@ -72,13 +75,17 @@ class TaskGraph:
             self._nx.add_edge(dep, task.id)
 
     def update(self, task: Task) -> None:
-        """Replace a task, re-reading its dependencies."""
-        old = self._tasks.get(task.id)
-        if old is not None:
-            for dep in old.dependencies:
+        """Replace a task, re-reading its dependencies.
+
+        Edges are removed by consulting the *graph*, not the (possibly already
+        mutated) task object — ``rewire()`` used to mutate the dependent before
+        calling this, which left a stale ``parent -> dependent`` edge and made
+        ``stuck_parents()`` fire on healthy splits (BASELINE_AUDIT DEF-04).
+        """
+        if task.id in self._nx:
+            for dep in list(self._nx.predecessors(task.id)):
                 self._dependents[dep].discard(task.id)
-                if self._nx.has_edge(dep, task.id):
-                    self._nx.remove_edge(dep, task.id)
+                self._nx.remove_edge(dep, task.id)
         self.add(task)
 
     def replace_all(self, tasks: Iterable[Task]) -> None:
@@ -191,8 +198,9 @@ class TaskGraph:
 
     # ------------------------------------------------------------- readiness
     def ready(self) -> list[Task]:
-        """Pending tasks whose dependencies are all ``DONE``.
+        """``PENDING`` tasks whose dependencies are all ``DONE``.
 
+        These are *promotable* to ``READY`` (SPEC §5.1 ``PENDING -> READY``).
         Sorted by (priority desc, depth asc, id) so the scheduler's choice is
         deterministic — important for reproducible benchmarks.
         """
@@ -203,6 +211,22 @@ class TaskGraph:
             and all((self._tasks.get(d) is not None and self._tasks[d].status is TaskStatus.DONE) for d in t.dependencies)
         ]
         return sorted(out, key=lambda t: (-t.priority, t.depth, t.id))
+
+    def claimable(self) -> list[Task]:
+        """``READY`` tasks, in dispatch order (same deterministic ordering)."""
+        out = [t for t in self._tasks.values() if t.status is TaskStatus.READY]
+        return sorted(out, key=lambda t: (-t.priority, t.depth, t.id))
+
+    def active(self) -> list[Task]:
+        """Every non-terminal task."""
+        return [t for t in self._tasks.values() if t.status not in TERMINAL_STATUSES]
+
+    def unfinished(self) -> list[Task]:
+        """Alias of :meth:`active`; naming used by the scheduler/report."""
+        return self.active()
+
+    def all_terminal(self) -> bool:
+        return bool(self._tasks) and all(t.status in TERMINAL_STATUSES for t in self._tasks.values())
 
     def blocked_by_failure(self) -> list[Task]:
         """Pending tasks that can never run because an ancestor is dead."""
@@ -243,7 +267,7 @@ class TaskGraph:
         eligible = [
             n
             for n, t in self._tasks.items()
-            if include_done or t.status not in {TaskStatus.DONE, TaskStatus.SPLIT, TaskStatus.CANCELLED}
+            if include_done or (t.status not in TERMINAL_STATUSES and t.status is not TaskStatus.SPLIT)
         ]
         if not eligible:
             return []
@@ -375,11 +399,14 @@ class TaskGraph:
                 if dep in self._tasks:
                     lines.append(f"  {dep} --> {task.id}")
         lines.append("  classDef pending fill:#f5f5f5,stroke:#9e9e9e,color:#212121;")
+        lines.append("  classDef ready fill:#fffde7,stroke:#fbc02d,color:#f57f17;")
         lines.append("  classDef running fill:#e3f2fd,stroke:#1976d2,color:#0d47a1;")
+        lines.append("  classDef review fill:#e0f7fa,stroke:#00838f,color:#006064;")
         lines.append("  classDef done fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;")
         lines.append("  classDef failed fill:#ffebee,stroke:#c62828,color:#b71c1c;")
         lines.append("  classDef blocked fill:#fff8e1,stroke:#f9a825,color:#e65100;")
         lines.append("  classDef split fill:#ede7f6,stroke:#6a1b9a,color:#4a148c;")
+        lines.append("  classDef quarantined fill:#fce4ec,stroke:#ad1457,color:#880e4f;")
         lines.append("  classDef cancelled fill:#eceff1,stroke:#607d8b,color:#37474f;")
         return "\n".join(lines)
 

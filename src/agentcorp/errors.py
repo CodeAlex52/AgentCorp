@@ -121,6 +121,4 @@ def is_retryable(error: BaseException) -> bool:
     """Single source of truth for 'should the retry loop try again?'."""
     if isinstance(error, AgentCorpError):
         return error.retryable
-    if isinstance(error, (TimeoutError, ConnectionError, OSError)):
-        return True
-    return False
+    return isinstance(error, (TimeoutError, ConnectionError, OSError))

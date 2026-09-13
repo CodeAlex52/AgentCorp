@@ -71,7 +71,7 @@ def build_provider(spec: str | None = None, **overrides: Any) -> AgentProvider:
 
     if spec in PRESETS:
         base_url, env_key, model, pricing = PRESETS[spec]
-        params: dict[str, Any] = {
+        http_params: dict[str, Any] = {
             "preset": spec,
             "base_url": base_url,
             "model": model,
@@ -85,14 +85,14 @@ def build_provider(spec: str | None = None, **overrides: Any) -> AgentProvider:
             )
             raise PermanentError(msg)
         if api_key:
-            params["api_key"] = api_key
-        params.update(overrides)
-        return OpenAICompatProvider(**params)
+            http_params["api_key"] = api_key
+        http_params.update(overrides)
+        return OpenAICompatProvider(**http_params)
 
     if spec.startswith(("http://", "https://")):
-        params = {"base_url": spec.rstrip("/"), "model": "local-model"}
-        params.update(overrides)
-        return OpenAICompatProvider(**params)
+        url_params: dict[str, Any] = {"base_url": spec.rstrip("/"), "model": "local-model"}
+        url_params.update(overrides)
+        return OpenAICompatProvider(**url_params)
 
     msg = f"unknown provider spec {spec!r}; known: {', '.join(known_specs())}"
     raise PermanentError(msg)

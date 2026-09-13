@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from .models import RepositoryContext, Requirement, Review, Task, WorkerOutcome
+from .models import Requirement, Review, Task, WorkerOutcome
 
 __all__ = ["Contract", "marker", "worker_messages", "reviewer_messages", "planner_messages", "prd_messages", "decomposer_messages"]
 

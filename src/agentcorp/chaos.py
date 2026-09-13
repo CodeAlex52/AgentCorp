@@ -140,7 +140,7 @@ class ChaosController:
     def enabled(self) -> bool:
         return self.config.enabled
 
-    def should_fault(self, role: str, task_id: str | None) -> bool:
+    def should_fault(self, role: str, task_id: str | None) -> bool:  # noqa: ARG002 - task_id belongs to the injector API
         if not self.enabled:
             return False
         if self.config.roles and role not in self.config.roles:

@@ -25,22 +25,24 @@ import sqlite3
 import threading
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .errors import StateError
-from .events import PROJECTION_EVENTS, Event, EventType
+from .events import Event, EventType
 from .models import (
     AgentRun,
     Artifact,
     BudgetSnapshot,
     Project,
-    Requirement,
     RepositoryContext,
+    Requirement,
     Review,
     Task,
     TaskStatus,
     Usage,
+    assert_transition,
 )
 from .util import short_hash, utcnow
 
@@ -181,6 +183,9 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # A competing writer (another process sharing the DB, e.g. a SIGKILL
+        # recovery test) must be retried, not surfaced as `database is locked`.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
 
@@ -201,29 +206,52 @@ class Store:
             yield self._conn
 
     # ------------------------------------------------------------------ events
+    def _insert_event(self, conn: sqlite3.Connection, event: Event) -> Event:
+        """Insert + project one event on an open transaction. Never commits."""
+        cur = conn.execute(
+            "INSERT INTO events (event_id, project_id, type, task_id, actor, payload,"
+            " schema_version, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                event.event_id
+                or short_hash(
+                    [
+                        event.project_id,
+                        event.type.value,
+                        event.created_at.isoformat(),
+                        event.task_id,
+                        event.payload,
+                    ],
+                    16,
+                ),
+                event.project_id,
+                event.type.value,
+                event.task_id,
+                event.actor,
+                json.dumps(event.payload, default=str),
+                event.schema_version,
+                event.created_at.isoformat(),
+            ),
+        )
+        stored = event.with_seq(int(cur.lastrowid or 0))
+        self._project(conn, stored)
+        return stored
+
     def append(self, event: Event) -> Event:
         """Persist ``event`` and fold it into the projections atomically."""
         with self._tx() as conn:
-            cur = conn.execute(
-                "INSERT INTO events (event_id, project_id, type, task_id, actor, payload,"
-                " schema_version, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    event.event_id or short_hash([event.project_id, event.type.value, utcnow().isoformat()], 16),
-                    event.project_id,
-                    event.type.value,
-                    event.task_id,
-                    event.actor,
-                    json.dumps(event.payload, default=str),
-                    event.schema_version,
-                    event.created_at.isoformat(),
-                ),
-            )
-            stored = event.with_seq(int(cur.lastrowid or 0))
-            self._project(conn, stored)
-        return stored
+            return self._insert_event(conn, event)
 
     def append_many(self, events: Iterable[Event]) -> list[Event]:
-        return [self.append(e) for e in events]
+        """Append a batch in **one** transaction — all of it or none of it.
+
+        SPEC C8 needs the child-DAG insertion to be atomic: a validation error
+        halfway through must not leave orphan children in the projection.
+        """
+        batch = list(events)
+        if not batch:
+            return []
+        with self._tx() as conn:
+            return [self._insert_event(conn, event) for event in batch]
 
     def list_events(
         self,
@@ -259,6 +287,191 @@ class Store:
                     "SELECT COUNT(*) AS c FROM events WHERE project_id=?", (project_id,)
                 ).fetchone()
         return int(row["c"])
+
+    def event_seqs(self, project_id: str) -> list[int]:
+        """All seq values for one project, ascending (gap + monotonicity tests)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq FROM events WHERE project_id=? ORDER BY seq", (project_id,)
+            ).fetchall()
+        return [int(r["seq"]) for r in rows]
+
+    def event_type_counts(self, project_id: str) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT type, COUNT(*) AS c FROM events WHERE project_id=? GROUP BY type",
+                (project_id,),
+            ).fetchall()
+        return {str(r["type"]): int(r["c"]) for r in rows}
+
+    def last_run_summary(self, project_id: str) -> dict[str, Any] | None:
+        """The ``RUN_FINISHED`` payload, if the run has finished."""
+        return self.get_document(project_id, "run_summary")
+
+    # ------------------------------------------------------- claim and lease
+    def claim_task(
+        self,
+        task_id: str,
+        *,
+        owner: str,
+        lease_seconds: float = 300.0,
+        now: datetime | None = None,
+        actor: str = "scheduler",
+    ) -> Event | None:
+        """Atomically move a READY task to RUNNING and lease it (SPEC §5.2, C4).
+
+        Returns the ``TASK_STARTED`` event on success, ``None`` if another
+        claimer got there first.  The guard is a single
+        ``UPDATE ... WHERE status='ready'`` so the winner is decided by SQLite's
+        row lock, never by a read-then-write race.
+        """
+        at = now or utcnow()
+        expires = at.timestamp() + lease_seconds
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET status=? WHERE id=? AND status=?",
+                (TaskStatus.RUNNING.value, task_id, TaskStatus.READY.value),
+            )
+            if cur.rowcount != 1:
+                return None
+            lease_iso = datetime.fromtimestamp(expires, tz=UTC).isoformat()
+            claimed = self._insert_event(
+                conn,
+                Event(
+                    project_id=self._project_of(conn, task_id),
+                    type=EventType.TASK_CLAIMED,
+                    task_id=task_id,
+                    actor=actor,
+                    created_at=at,
+                    payload={
+                        "owner": owner,
+                        "lease_seconds": lease_seconds,
+                        "lease_expires_at": lease_iso,
+                    },
+                ),
+            )
+            return self._insert_event(
+                conn,
+                Event(
+                    project_id=self._project_of(conn, task_id),
+                    type=EventType.TASK_STARTED,
+                    task_id=task_id,
+                    actor=actor,
+                    created_at=at,
+                    payload={"owner": owner, "claim_seq": claimed.seq},
+                ),
+            )
+
+    def renew_lease(
+        self,
+        task_id: str,
+        *,
+        lease_seconds: float = 300.0,
+        now: datetime | None = None,
+    ) -> Task:
+        """Extend a RUNNING task's lease (progress heartbeat)."""
+        at = now or utcnow()
+        with self._tx() as conn:
+            task = self._load_task(conn, task_id)
+            if task.status is not TaskStatus.RUNNING:
+                msg = f"cannot renew lease of task {task_id!r} in status {task.status.value!r}"
+                raise StateError(msg)
+            task.lease_expires_at = datetime.fromtimestamp(at.timestamp() + lease_seconds, tz=UTC)
+            task.progress_at = at
+            task.updated_at = at
+            self._upsert_task(conn, task, self._project_of(conn, task_id))
+        return task
+
+    def stale_running(self, now: datetime | None = None) -> list[Task]:
+        """RUNNING tasks whose lease expired — orphans from a crash (C5).
+
+        Tasks without a lease (claimed by older code) fall back to
+        ``started_at`` and are considered stale immediately, which is the safe
+        direction for recovery.
+        """
+        at = now or utcnow()
+        out: list[Task] = []
+        for task in self.list_tasks_all():
+            if task.status is not TaskStatus.RUNNING:
+                continue
+            deadline = task.lease_expires_at or task.started_at
+            if deadline is None or deadline <= at:
+                out.append(task)
+        return out
+
+    def list_tasks_all(self) -> list[Task]:
+        """Every task in the store, across projects (recovery sweeps)."""
+        with self._lock:
+            rows = self._conn.execute("SELECT data FROM tasks ORDER BY id").fetchall()
+        return [Task.model_validate(json.loads(r["data"])) for r in rows]
+
+    def recover_stale_task(
+        self,
+        task_id: str,
+        *,
+        reason: str = "lease_expired",
+        now: datetime | None = None,
+        max_attempts: int | None = None,
+    ) -> bool:
+        """Re-dispatch an orphaned RUNNING task through the legal two-step path.
+
+        ``RUNNING -> FAILED -> READY`` (DEC-006): the crash consumes one attempt;
+        if the attempt budget is spent the task is quarantined instead.  Returns
+        ``True`` when the task is READY again.
+        """
+        at = now or utcnow()
+        with self._tx() as conn:
+            task = self._load_task(conn, task_id)
+            if task.status is not TaskStatus.RUNNING:
+                return False
+            project_id = self._project_of(conn, task_id)
+            self._insert_event(
+                conn,
+                Event(
+                    project_id=project_id,
+                    type=EventType.TASK_FAILED,
+                    task_id=task_id,
+                    actor="recovery",
+                    created_at=at,
+                    payload={"reason": reason, "recoverable": True},
+                ),
+            )
+            refreshed = self._load_task(conn, task_id)
+            limit = max_attempts if max_attempts is not None else refreshed.max_attempts
+            if refreshed.attempts >= limit or refreshed.attempts >= refreshed.max_attempts:
+                self._insert_event(
+                    conn,
+                    Event(
+                        project_id=project_id,
+                        type=EventType.TASK_QUARANTINED,
+                        task_id=task_id,
+                        actor="recovery",
+                        created_at=at,
+                        payload={"reason": f"{reason}: attempts exhausted"},
+                    ),
+                )
+                return False
+            self._insert_event(
+                conn,
+                Event(
+                    project_id=project_id,
+                    type=EventType.TASK_RETRIED,
+                    task_id=task_id,
+                    actor="recovery",
+                    created_at=at,
+                    payload={"reason": reason, "recoverable": True},
+                ),
+            )
+        return True
+
+    def touch_progress(self, task_id: str, *, now: datetime | None = None) -> None:
+        """Record that a task made observable progress (supervisor input)."""
+        at = now or utcnow()
+        with self._tx() as conn:
+            task = self._load_task(conn, task_id)
+            task.progress_at = at
+            task.updated_at = at
+            self._upsert_task(conn, task, self._project_of(conn, task_id))
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> Event:
@@ -309,14 +522,21 @@ class Store:
         return Task.model_validate(json.loads(row["data"]))
 
     def _mutate_task(self, conn: sqlite3.Connection, task_id: str, event: Event, **changes: Any) -> Task:
-        """Apply field changes to a task.
+        """Apply field changes to a task, enforcing the transition whitelist.
 
         ``updated_at`` comes from ``event.created_at``, never from the wall
         clock: the projection must be a pure function of the log, otherwise
         :meth:`rebuild_projections` produces different bytes than the original
         write and the digest check fails.
         """
-        task = self._load_task(conn, task_id).model_copy(update=changes)
+        task = self._load_task(conn, task_id)
+        target = changes.get("status")
+        if isinstance(target, TaskStatus):
+            # Enforced here too (not just in the scheduler) so that replaying a
+            # hand-crafted or corrupted log fails loudly instead of projecting
+            # an impossible state (DEC-003).
+            assert_transition(task, target, reason=f"event {event.type.value}")
+        task = task.model_copy(update=changes)
         task.updated_at = event.created_at
         self._upsert_task(conn, task, self._project_of(conn, task_id))
         return task
@@ -384,77 +604,182 @@ class Store:
         assert event.task_id is not None
         patch = dict(event.payload.get("patch", {}))
         patch.pop("id", None)
-        self._mutate_task(conn, event.task_id, event, **patch)
+        if "status" in patch:
+            patch["status"] = TaskStatus(patch["status"])
+        # Validate the merged document so string datetimes from the payload are
+        # coerced before they reach the JSON column.
+        current = self._load_task(conn, event.task_id)
+        merged = {**current.model_dump(), **patch}
+        updated = Task.model_validate(merged)
+        target = patch.get("status")
+        if isinstance(target, TaskStatus):
+            assert_transition(current, target, reason="TASK_UPDATED")
+        updated.updated_at = event.created_at
+        self._upsert_task(conn, updated, self._project_of(conn, event.task_id))
 
     def _proj_task_ready(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
-        self._mutate_task(conn, event.task_id, event, status=TaskStatus.PENDING)
+        self._mutate_task(conn, event.task_id, event, status=TaskStatus.READY)
+
+    def _proj_task_claimed(self, conn: sqlite3.Connection, event: Event) -> None:
+        """Record the lease. Status is flipped by the guarded UPDATE in claim_task."""
+        assert event.task_id is not None
+        task = self._load_task(conn, event.task_id)
+        lease_iso = event.payload.get("lease_expires_at")
+        lease = (
+            datetime.fromisoformat(str(lease_iso)) if lease_iso else task.lease_expires_at
+        )
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
+            owner=event.payload.get("owner", task.owner),
+            claimed_at=event.created_at,
+            lease_expires_at=lease,
+            progress_at=event.created_at,
+        )
 
     def _proj_task_started(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
         task = self._load_task(conn, event.task_id)
-        self._mutate_task(conn, event.task_id, event,
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
             status=TaskStatus.RUNNING,
             owner=event.payload.get("owner", task.owner),
             attempts=task.attempts + 1,
             started_at=event.created_at,
+            progress_at=event.created_at,
             blocked_reason=None,
         )
 
-    def _proj_task_completed(self, conn: sqlite3.Connection, event: Event) -> None:
+    def _proj_task_finished(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
         task = self._load_task(conn, event.task_id)
         artifacts = list(dict.fromkeys([*task.artifacts, *event.payload.get("artifacts", [])]))
-        self._mutate_task(conn, event.task_id, event,
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
             status=TaskStatus.DONE,
             finished_at=event.created_at,
             failure_reason=None,
             blocked_reason=None,
+            lease_expires_at=None,
             artifacts=artifacts,
         )
 
+    # Baseline alias.
+    _proj_task_completed = _proj_task_finished
+
     def _proj_task_failed(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
-        self._mutate_task(conn, event.task_id, event,
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
             status=TaskStatus.FAILED,
             finished_at=event.created_at,
+            lease_expires_at=None,
             failure_reason=str(event.payload.get("reason", ""))[:2000],
         )
 
     def _proj_task_blocked(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
-        self._mutate_task(conn, event.task_id, event,
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
             status=TaskStatus.BLOCKED,
             blocked_reason=str(event.payload.get("reason", ""))[:2000],
         )
 
     def _proj_task_unblocked(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
-        self._mutate_task(conn, event.task_id, event, status=TaskStatus.PENDING, blocked_reason=None)
+        self._mutate_task(
+            conn, event.task_id, event, status=TaskStatus.READY, blocked_reason=None
+        )
 
     def _proj_task_retried(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
-        self._mutate_task(conn, event.task_id, event,
-            status=TaskStatus.PENDING,
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
+            status=TaskStatus.READY,
             blocked_reason=None,
             failure_reason=None,
             owner=None,
+            lease_expires_at=None,
+        )
+
+    def _proj_task_rework(self, conn: sqlite3.Connection, event: Event) -> None:
+        """``REVIEW -> READY`` after a rejection (DEC-007)."""
+        assert event.task_id is not None
+        task = self._load_task(conn, event.task_id)
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
+            status=TaskStatus.READY,
+            blocked_reason=None,
+            failure_reason=None,
+            rework_count=task.rework_count + 1,
+            owner=None,
+            lease_expires_at=None,
         )
 
     def _proj_task_split(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
-        self._mutate_task(conn, event.task_id, event,
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
             status=TaskStatus.SPLIT,
-            finished_at=event.created_at,
             blocked_reason=None,
+            lease_expires_at=None,
+        )
+
+    def _proj_task_aggregated(self, conn: sqlite3.Connection, event: Event) -> None:
+        assert event.task_id is not None
+        raw = str(event.payload.get("status", TaskStatus.DONE.value))
+        target = TaskStatus(raw)
+        if target not in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            msg = f"TASK_AGGREGATED cannot aggregate to {raw!r}"
+            raise StateError(msg)
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
+            status=target,
+            finished_at=event.created_at,
+            failure_reason=(
+                str(event.payload.get("reason", ""))[:2000] if target is not TaskStatus.DONE else None
+            ),
+        )
+
+    def _proj_task_quarantined(self, conn: sqlite3.Connection, event: Event) -> None:
+        assert event.task_id is not None
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
+            status=TaskStatus.QUARANTINED,
+            finished_at=event.created_at,
+            failure_reason=str(event.payload.get("reason", ""))[:2000],
         )
 
     def _proj_task_cancelled(self, conn: sqlite3.Connection, event: Event) -> None:
         assert event.task_id is not None
-        self._mutate_task(conn, event.task_id, event,
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
             status=TaskStatus.CANCELLED,
             finished_at=event.created_at,
-            failure_reason=str(event.payload.get("reason", "")),
+            lease_expires_at=None,
+            failure_reason=str(event.payload.get("reason", ""))[:2000],
         )
 
     def _proj_agent_run_started(self, conn: sqlite3.Connection, event: Event) -> None:
@@ -513,11 +838,96 @@ class Store:
 
     def _proj_budget_exceeded(self, conn: sqlite3.Connection, event: Event) -> None:
         self._put_document(conn, event.project_id, "budget_exceeded", dict(event.payload), event.created_at)
+        self._put_document(conn, event.project_id, "budget_exhausted", dict(event.payload), event.created_at)
+
+    #: SPEC §5.4 name.
+    _proj_budget_exhausted = _proj_budget_exceeded
+
+    def _proj_budget_warning(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._put_document(conn, event.project_id, "budget_warning", dict(event.payload), event.created_at)
+
+    # ------------------------------------------------------------------- runs
+    def _proj_run_started(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._put_document(
+            conn,
+            event.project_id,
+            "run_state",
+            {"status": "RUNNING", **dict(event.payload)},
+            event.created_at,
+        )
+        self._set_project_status(conn, event.project_id, "active", event.created_at)
+
+    def _proj_run_resumed(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._put_document(
+            conn,
+            event.project_id,
+            "run_state",
+            {"status": "RESUMED", **dict(event.payload)},
+            event.created_at,
+        )
+        self._put_document(conn, event.project_id, "last_resume", dict(event.payload), event.created_at)
+        self._set_project_status(conn, event.project_id, "active", event.created_at)
+
+    def _proj_run_finished(self, conn: sqlite3.Connection, event: Event) -> None:
+        status = str(event.payload.get("status", "FAILED"))
+        self._put_document(
+            conn,
+            event.project_id,
+            "run_summary",
+            {
+                "status": status,
+                "run_id": event.payload.get("run_id", event.project_id),
+                "finished_at": event.created_at.isoformat(),
+                **dict(event.payload),
+            },
+            event.created_at,
+        )
+        project_status = {
+            "DONE": "completed",
+            "FAILED": "failed",
+            "BUDGET_EXHAUSTED": "failed",
+            "DEADLOCK": "failed",
+            "CANCELLED": "cancelled",
+        }.get(status, "failed")
+        self._set_project_status(conn, event.project_id, project_status, event.created_at)
 
     def _proj_review_passed(self, conn: sqlite3.Connection, event: Event) -> None:
         self._insert_review(conn, event)
 
     def _proj_review_failed(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._insert_review(conn, event)
+
+    def _proj_review_started(self, conn: sqlite3.Connection, event: Event) -> None:
+        assert event.task_id is not None
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
+            status=TaskStatus.REVIEW,
+            progress_at=event.created_at,
+        )
+
+    def _proj_review_approved(self, conn: sqlite3.Connection, event: Event) -> None:
+        assert event.task_id is not None
+        self._insert_review(conn, event)
+        task = self._load_task(conn, event.task_id)
+        artifacts = list(
+            dict.fromkeys([*task.artifacts, *event.payload.get("artifacts", [])])
+        )
+        self._mutate_task(
+            conn,
+            event.task_id,
+            event,
+            status=TaskStatus.DONE,
+            finished_at=event.created_at,
+            failure_reason=None,
+            blocked_reason=None,
+            lease_expires_at=None,
+            artifacts=artifacts,
+        )
+
+    def _proj_review_rejected(self, conn: sqlite3.Connection, event: Event) -> None:
+        """Record the verdict; the status move is TASK_REWORK / TASK_FAILED (DEC-007)."""
         self._insert_review(conn, event)
 
     def _insert_review(self, conn: sqlite3.Connection, event: Event) -> None:
@@ -552,6 +962,16 @@ class Store:
                 art.created_at.isoformat(),
             ),
         )
+        if art.task_id:
+            task = self._load_task(conn, art.task_id)
+            if art.path not in task.artifacts:
+                self._mutate_task(
+                    conn,
+                    art.task_id,
+                    event,
+                    artifacts=[*task.artifacts, art.path],
+                    progress_at=event.created_at,
+                )
 
     def _proj_supervisor_intervention(self, conn: sqlite3.Connection, event: Event) -> None:
         self._put_document(conn, event.project_id, f"intervention:{event.payload.get('id', event.seq)}", dict(event.payload), event.created_at)
@@ -559,17 +979,44 @@ class Store:
     def _proj_supervisor_tick(self, conn: sqlite3.Connection, event: Event) -> None:
         self._put_document(conn, event.project_id, "last_supervisor_tick", dict(event.payload), event.created_at)
 
-    def _proj_note(self, conn: sqlite3.Connection, event: Event) -> None:
+    def _proj_intervention_raised(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._put_document(
+            conn,
+            event.project_id,
+            f"intervention:{event.payload.get('id', event.seq)}",
+            dict(event.payload),
+            event.created_at,
+        )
+
+    def _proj_intervention_applied(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._put_document(
+            conn,
+            event.project_id,
+            f"intervention_applied:{event.payload.get('id', event.seq)}",
+            dict(event.payload),
+            event.created_at,
+        )
+
+    def _proj_note(self, _conn: sqlite3.Connection, _event: Event) -> None:
         return None
 
     def _proj_plan_created(self, conn: sqlite3.Connection, event: Event) -> None:
         self._put_document(conn, event.project_id, "plan", dict(event.payload), event.created_at)
 
-    def _proj_chaos_injected(self, conn: sqlite3.Connection, event: Event) -> None:
+    def _proj_chaos_injected(self, _conn: sqlite3.Connection, _event: Event) -> None:
         return None
 
     def _proj_resume(self, conn: sqlite3.Connection, event: Event) -> None:
         self._put_document(conn, event.project_id, "last_resume", dict(event.payload), event.created_at)
+
+    def _proj_cycle_detected(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._put_document(conn, event.project_id, "cycle_detected", dict(event.payload), event.created_at)
+
+    def _proj_deadlock_detected(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._put_document(conn, event.project_id, "deadlock", dict(event.payload), event.created_at)
+
+    def _proj_validation_failed(self, conn: sqlite3.Connection, event: Event) -> None:
+        self._put_document(conn, event.project_id, "validation_failed", dict(event.payload), event.created_at)
 
     # ------------------------------------------------------------- projections
     def _put_document(
@@ -657,7 +1104,7 @@ class Store:
             rows = self._conn.execute(
                 "SELECT status, COUNT(*) AS c FROM tasks WHERE project_id=? GROUP BY status", (project_id,)
             ).fetchall()
-        counts = {s: 0 for s in TaskStatus}
+        counts = dict.fromkeys(TaskStatus, 0)
         for row in rows:
             counts[TaskStatus(row["status"])] = int(row["c"])
         return counts
@@ -841,6 +1288,16 @@ class Store:
                 self._project(conn, self._row_to_event(row))
         return len(rows)
 
+    #: SPEC C11 wording; identical semantics to :meth:`rebuild_projections`.
+    def rebuild_from_events(self, project_id: str | None = None) -> int:
+        return self.rebuild_projections(project_id)
+
+    def verify_replay(self, project_id: str) -> bool:
+        """True when replaying the log reproduces the current projection byte-for-byte."""
+        before = self.projection_digest(project_id)
+        self.rebuild_projections(project_id)
+        return before == self.projection_digest(project_id)
+
     def projection_digest(self, project_id: str | None = None) -> str:
         """Stable fingerprint of all queryable state (for consistency tests)."""
         payload: dict[str, Any] = {}
@@ -870,6 +1327,10 @@ class Store:
                 problems.append(f"task {task.id} is done but declares no acceptance criteria")
         for run in self.unfinished_runs(project_id):
             problems.append(f"run {run.id} (task {run.task_id}) started but never finished")
+        seqs = self.event_seqs(project_id)
+        for previous, current in zip(seqs, seqs[1:], strict=False):
+            if current != previous + 1:
+                problems.append(f"event seq gap: {previous} -> {current}")
         budget_doc = self.get_document(project_id, "budget")
         if budget_doc is None:
             problems.append("no budget snapshot recorded")
@@ -878,13 +1339,11 @@ class Store:
     # ------------------------------------------------------------------ export
     def export_state(self, project_id: str) -> dict[str, Any]:
         """JSON-serialisable snapshot — used by the web UI and the report."""
+        project = self.get_project(project_id)
+        requirement = self.get_requirement(project_id)
         return {
-            "project": (self.get_project(project_id).model_dump(mode="json") if self.get_project(project_id) else None),
-            "requirement": (
-                self.get_requirement(project_id).model_dump(mode="json")
-                if self.get_requirement(project_id)
-                else None
-            ),
+            "project": project.model_dump(mode="json") if project else None,
+            "requirement": requirement.model_dump(mode="json") if requirement else None,
             "tasks": [t.model_dump(mode="json") for t in self.list_tasks(project_id)],
             "reviews": [r.model_dump(mode="json") for r in self.list_reviews(project_id)],
             "runs": [r.model_dump(mode="json") for r in self.list_runs(project_id)],

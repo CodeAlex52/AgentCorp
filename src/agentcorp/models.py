@@ -12,8 +12,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .errors import StateError
 from .util import new_id, utcnow
 
 __all__ = [
@@ -22,6 +23,9 @@ __all__ = [
     "RiskLevel",
     "TERMINAL_STATUSES",
     "ACTIVE_STATUSES",
+    "ALLOWED_TRANSITIONS",
+    "transition_allowed",
+    "assert_transition",
     "AcceptanceCriterion",
     "Task",
     "Requirement",
@@ -50,24 +54,107 @@ def _new(prefix: str) -> str:
 class TaskStatus(StrEnum):
     """Lifecycle of a task node.
 
-    ``PENDING`` is the only non-terminal status a task can be *created* in.
-    ``READY`` is deliberately absent: readiness is derived from the graph
-    (all dependencies ``DONE``), never stored, so it cannot drift.
+    The full whitelist lives in :data:`ALLOWED_TRANSITIONS`.  ``READY`` is a
+    stored status (SPEC §5.1): the scheduler promotes a ``PENDING`` task once all
+    its dependencies are ``DONE``, and the atomic claim only ever matches
+    ``status='ready'`` rows.  ``SPLIT`` is *not* terminal — the parent aggregates
+    to ``DONE``/``FAILED`` once every child reaches a terminal status.
     """
 
     PENDING = "pending"
+    READY = "ready"
     RUNNING = "running"
+    REVIEW = "review"
+    SPLIT = "split"  # decomposed into children; waits for them to finish
     BLOCKED = "blocked"
     FAILED = "failed"
     DONE = "done"
-    SPLIT = "split"  # decomposed into children; terminal for the parent
-    CANCELLED = "cancelled"  # cancelled by the supervisor
+    QUARANTINED = "quarantined"  # poison task: isolated, never re-dispatched
+    CANCELLED = "cancelled"
 
 
 TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
-    {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.SPLIT, TaskStatus.CANCELLED}
+    {TaskStatus.DONE, TaskStatus.QUARANTINED, TaskStatus.CANCELLED}
 )
-ACTIVE_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.RUNNING, TaskStatus.PENDING})
+#: Statuses a task can be created/observed in while the run is still alive.
+ACTIVE_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.PENDING,
+        TaskStatus.READY,
+        TaskStatus.RUNNING,
+        TaskStatus.REVIEW,
+        TaskStatus.SPLIT,
+        TaskStatus.BLOCKED,
+    }
+)
+
+#: SPEC §5.1 verbatim.  Anything not listed here raises :class:`StateError`.
+ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
+    TaskStatus.PENDING: frozenset({TaskStatus.READY, TaskStatus.CANCELLED}),
+    TaskStatus.READY: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.BLOCKED}
+    ),
+    TaskStatus.RUNNING: frozenset(
+        {
+            TaskStatus.DONE,
+            TaskStatus.FAILED,
+            TaskStatus.REVIEW,
+            TaskStatus.SPLIT,
+            TaskStatus.BLOCKED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.REVIEW: frozenset(
+        {TaskStatus.DONE, TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    ),
+    # DONE is reached through TASK_AGGREGATED after every child is terminal.
+    TaskStatus.SPLIT: frozenset(
+        {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    ),
+    TaskStatus.BLOCKED: frozenset(
+        {TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    ),
+    # READY here is the retry edge, guarded by attempts < max_attempts.
+    TaskStatus.FAILED: frozenset({TaskStatus.READY, TaskStatus.QUARANTINED}),
+    TaskStatus.DONE: frozenset(),
+    TaskStatus.QUARANTINED: frozenset(),
+    TaskStatus.CANCELLED: frozenset(),
+}
+
+#: Transitions that additionally require ``attempts < max_attempts`` on the task.
+ATTEMPT_GUARDED_TRANSITIONS: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
+    {(TaskStatus.FAILED, TaskStatus.READY)}
+)
+
+
+def transition_allowed(current: TaskStatus, target: TaskStatus) -> bool:
+    """Is ``current -> target`` on the whitelist? (No attempt guard applied.)"""
+    return target in ALLOWED_TRANSITIONS.get(current, frozenset())
+
+
+def assert_transition(task: Task, target: TaskStatus, *, reason: str = "") -> None:
+    """Raise :class:`StateError` unless ``task`` may legally move to ``target``.
+
+    Enforces the whitelist and the attempt guard on the guarded retry edge
+    (``FAILED -> READY`` requires ``attempts < max_attempts``).
+    """
+    current = task.status
+    if not transition_allowed(current, target):
+        detail = f" ({reason})" if reason else ""
+        msg = (
+            f"illegal task transition {current.value!r} -> {target.value!r} "
+            f"for {task.id!r}{detail}"
+        )
+        raise StateError(msg)
+    if (
+        (current, target) in ATTEMPT_GUARDED_TRANSITIONS
+        and task.attempts >= task.max_attempts
+    ):
+        msg = (
+            f"task {task.id!r} cannot move {current.value!r} -> {target.value!r}: "
+            f"attempts {task.attempts} >= max_attempts {task.max_attempts}"
+        )
+        raise StateError(msg)
 
 
 class TaskKind(StrEnum):
@@ -140,6 +227,15 @@ class Task(BaseModel):
     depth: int = 0
     attempts: int = 0
     max_attempts: int = 3
+    #: Rework loops completed after reviewer rejections (C12 cap).
+    rework_count: int = 0
+    max_reworks: int = 2
+    #: Lease bookkeeping for exactly-once claim + crash recovery (SPEC §5.2).
+    claimed_at: datetime | None = None
+    lease_expires_at: datetime | None = None
+    #: Last observed sign of progress (claim, finished agent run, artifact).
+    #: The supervisor keys its stuck detection off this, not off wall time.
+    progress_at: datetime | None = None
     #: Repo paths this task is expected to touch.  The scheduler refuses to run
     #: two tasks with overlapping ``touch_paths`` concurrently.
     touch_paths: list[str] = Field(default_factory=list)
@@ -288,7 +384,13 @@ class Usage(BaseModel):
 
 
 class BudgetLimits(BaseModel):
-    """Ceilings.  ``None`` means unbounded for that dimension."""
+    """Ceilings.  ``None`` means unbounded for that dimension.
+
+    SPEC C7 requires four hard-stop classes: tokens, cost, task count and
+    wall-clock seconds.  ``max_agent_calls`` is the call-level sibling of
+    ``max_tasks`` (a task may make several calls) and ``max_tokens_per_task``
+    bounds a single task's consumption.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -296,6 +398,10 @@ class BudgetLimits(BaseModel):
     max_cost_usd: float | None = None
     max_agent_calls: int | None = None
     max_tokens_per_task: int | None = None
+    #: Maximum number of task dispatches for the whole run.
+    max_tasks: int | None = None
+    #: Maximum wall-clock seconds since the run started.
+    max_wall_seconds: float | None = None
 
 
 class BudgetSnapshot(BaseModel):
@@ -437,7 +543,7 @@ class Project(BaseModel):
     requirement_id: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
-    status: Literal["active", "paused", "completed", "failed"] = "active"
+    status: Literal["active", "paused", "completed", "failed", "cancelled"] = "active"
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
