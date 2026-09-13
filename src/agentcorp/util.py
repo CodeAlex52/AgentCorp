@@ -21,6 +21,8 @@ __all__ = [
     "FakeClock",
     "Sleeper",
     "system_sleep",
+    "noop_sleep",
+    "SequentialIdFactory",
     "utcnow",
     "new_id",
     "short_hash",
@@ -84,6 +86,26 @@ Sleeper = Callable[[float], Awaitable[None]]
 async def system_sleep(seconds: float) -> None:
     """Default sleeper. Tests inject a recording/no-op sleeper instead."""
     await asyncio.sleep(seconds)
+
+
+async def noop_sleep(_seconds: float) -> None:
+    """Deterministic sleeper for tests and the benchmark demo (no real wait)."""
+
+
+class SequentialIdFactory:
+    """Deterministic id source: ``T-0001``, ``T-0002``, … per prefix.
+
+    Used by tests and `examples/end_to_end.py` so a whole run is byte-for-byte
+    reproducible (DEC-008).  Production code takes the default :func:`new_id`.
+    """
+
+    def __init__(self) -> None:
+        self._counters: dict[str, int] = {}
+
+    def __call__(self, prefix: str) -> str:
+        index = self._counters.get(prefix, 0) + 1
+        self._counters[prefix] = index
+        return f"{prefix}-{index:04d}"
 
 
 def new_id(prefix: str) -> str:
