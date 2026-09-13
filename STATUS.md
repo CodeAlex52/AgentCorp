@@ -1,7 +1,7 @@
 # WS02 STATUS (2026-09-14T03:15:00+08:00)
 
 state: done
-current: v0 完工合同（SPEC §8）达成：307 个离线确定性测试全绿（5.0s）、demo 字节复现、benchmark JSON 通过 §6 校验、mypy strict/ruff 干净。Gauntlet 全量复测仅剩 1 条失败（`test_gp_case_folding_does_not_unlock_git_metadata`），且该用例代码自相矛盾（详见 FIND-011 行），非产品缺陷。
+current: v0 完工合同（SPEC §8）达成：308 个离线确定性测试全绿（5.0s）、demo 字节复现、benchmark JSON 通过 §6 校验、mypy strict/ruff 干净。Gauntlet 全量复测仅剩 1 条失败（`test_gp_case_folding_does_not_unlock_git_metadata`），且该用例代码自相矛盾（详见 FIND-011 行），非产品缺陷。
 
 progress:
 - 2026-09-14 Step 4+5 完成：`examples/end_to_end.py`（确定性 clock/id/无 sleep）→ `benchmarks/self_hosting_sim.json` 字节复现；`docs/report_schema.json`、`scripts/validate_benchmark.py`、`scripts/reproduce_all.sh`；`docs/ARCHITECTURE.md`、DEC-013…DEC-021。（commit 50ae56d 及后续）
@@ -16,7 +16,7 @@ artifacts:
 - benchmarks/self_hosting_sim.json（schema §6 校验通过，可字节复现）
 - examples/end_to_end.py, examples/demo_repo/
 - scripts/validate_benchmark.py, scripts/reproduce_all.sh
-- tests/（307 条：test_capability_matrix.py、test_redteam_findings.py、test_ac05_regressions.py、test_chaos_engine.py 等 14 个文件）
+- tests/（308 条：test_capability_matrix.py、test_redteam_findings.py、test_ac05_regressions.py、test_chaos_engine.py 等 14 个文件）
 
 blockers: 无（1 条 Gauntlet 用例为测试自身矛盾，见「逐条状态」FIND-011/G-P）
 
@@ -55,7 +55,7 @@ next:
 
 ### 2. 测试与静态检查（原始结论）
 
-- `uv run pytest` → `307 passed in 5.00s`（含 `-m slow` 的 SIGKILL 子进程用例；全程离线、无 API key）
+- `uv run pytest` → `308 passed in 4.97s`（含 `-m slow` 的 SIGKILL 子进程用例；全程离线、无 API key）
 - `uv run mypy src/agentcorp` → `Success: no issues found in 33 source files`
 - `uv run ruff check` → `All checks passed!`
 - demo 复现：连续两次 `uv run python examples/end_to_end.py --quiet` 输出 JSON `diff` 无差异
@@ -92,9 +92,9 @@ AC-05 其余项（token 硬上限、挂死调用 liveness、并发 split 上界�
 | F06 并发 split 突破 max_total_tasks | **fixed** | a9fe830：`_insert_children` 插入时按当前图复核 |
 | F07 cancel 被 rebuild 抹掉 | **fixed** | a9fe830：control 表；repro `test_p2_2_*` 通过 |
 | F08 seq gap 误报 | **fixed** | 2b28757（per-run seq） |
-| F09 TASK_CREATED 绕过白名单 | **partial（wontfix-by-design）** | 已修“重复创建覆盖既有任务”的一半（`StateError: already exists`，见 DEC-023）；“非 PENDING 出生”**有意保留**：Gauntlet 的 G-A 验收夹具正是用 `TASK_CREATED` 以 DONE 状态植入任务，一旦禁止出生状态就会回归两条已通过的验收用例（`test_ga_store_batch_insert_is_atomic_on_rejected_transition`、`test_ga_store_projection_refuses_illegal_transition`）。取舍与证据见 DEC-023；repro `test_p2_4_*` 因此仍红。 |
+| F09 TASK_CREATED 绕过白名单 | **partial（wontfix-by-design）** |（AC-05 repro `test_p2_4_*` 仍红：仅“非 PENDING 出生”一半未采用，见下） 已修“重复创建覆盖既有任务”的一半（`StateError: already exists`，见 DEC-023）；“非 PENDING 出生”**有意保留**：Gauntlet 的 G-A 验收夹具正是用 `TASK_CREATED` 以 DONE 状态植入任务，一旦禁止出生状态就会回归两条已通过的验收用例（`test_ga_store_batch_insert_is_atomic_on_rejected_transition`、`test_ga_store_projection_refuses_illegal_transition`）。取舍与证据见 DEC-023；repro `test_p2_4_*` 因此仍红。 |
 | F10 幂等键/重复 artifact | **fixed（artifact 层）** | a9fe830：确定性 artifact id；repro `test_p2_6_*` 通过。事件层仍记录每次尝试（审计事实），幂等键语义见 DEC-005/DEC-021。 |
-| F11 过期 cancel 改写已完成 run | **fixed** | 2b28757：run 完成后投递的 cancel 只写 control 文档，不改写 run_summary；`_finish_run` 只在未结束时执行 |
+| F11 过期 cancel 改写已完成 run | **fixed** | 0c571da+：`resume` 对已终态 run 幂等 no-op，并丢弃迟到的 cancel 信号（`clear_control`）；回归 `tests/test_ac05_regressions.py::test_ac05_stale_cancel_does_not_rewrite_a_finished_run`；AC-05 repro `test_p2_5_*` 转绿 |
 | F12 评审独立性 | **pass（设计满足）** | 独立实例/运行时/角色 + `enforce_independence`；`test_c12_negative_self_review_is_forbidden` |
 | F13 false_positive_guarded 硬编码 | **partial（deferred）** | 报告 `interventions.false_positive_guarded` 仍为结构性断言 True（schema 为 boolean）；supervisor 已把“guard 命中次数”和 `false_positives` 计入 `RunOutcome.supervisor` 快照，行为由测试证明（`test_g_m_*`、`test_ac05_supervisor_stuck_ids_ignores_progress`）。列入已知缺陷 #4 |
 | F14 event_id 唯一约束 | **fixed** | 2b28757 |
@@ -106,7 +106,7 @@ AC-05 其余项（token 硬上限、挂死调用 liveness、并发 split 上界�
 
 ### 4. 已知缺陷（按价值排序，≤10）
 
-1. **C7 residual（budget）**：并发在飞调用按估算预留、按实际结算，极端情况下最后一次调用可使 `tokens` 小幅越过 `max_tokens`（AC-05 repro `test_p1_2_*`）。修复方向：reservation + 结算，或把 `max_tokens` 传给 provider 作为输出上限。
+1. **C7 residual（budget）**：已完成 admission 预留/结算（DEC-022，AC-05 repro `test_p1_2_*` 转绿），残留风险仅剩“completion 远大于 prompt 的 provider 可能一次性小幅越界”。彻底闭合需把 `max_tokens=remaining` 传给 provider 并信任其执行。
 2. **单进程假设**：同一 run 被两个进程同时 `resume` 时，强制重派可能双跑（无 DB 级所有权租约/心跳）。v0 文档化为“一个 run 一个引擎进程”。
 3. **路径 TOCTOU**：校验与写入之间存在竞态窗口（恶意本地进程可偷换目录为符号链接）；威胁模型是恶意仓库内容，不是本机多用户。
 4. **`interventions.false_positive_guarded` 为结构性断言**：字段恒为 True；supervisor 已统计 guard 命中和 `false_positives`，建议改为运行期证据。
@@ -116,6 +116,14 @@ AC-05 其余项（token 硬上限、挂死调用 liveness、并发 split 上界�
 8. **report `success_rate` 分母**：当前按“叶子任务 done / 叶子任务数”，聚合父节点不计入；语义已文档化但可能与外部直觉不同。
 9. **`Review.must_fix` 依赖 HIGH/CRITICAL issue**：模型给出 REJECT 但只有 MEDIUM issue 时由确定性检查兜底补 HIGH，仍属启发式。
 10. **CLI `graph --format dot` 无对应测试**：dot 输出仅冒烟覆盖。
+
+### 4b. 验收套件之间的冲突（需仲裁，非产品缺陷）
+
+| 冲突点 | Gauntlet 期望 | AC-05 期望 | 现状 |
+|---|---|---|---|
+| `TASK_CREATED` 出生状态 | G-A 夹具用 `TASK_CREATED` 以 DONE 状态植入任务（`test_ga_store_batch_insert_is_atomic_on_rejected_transition`、`test_ga_store_projection_refuses_illegal_transition`） | p2_4 要求 DONE 出生被拒 | 保留出生自由（重复 id 覆盖已禁止），G-A 两条保持绿；AC-05 `test_p2_4_*` 仍红，记录为 DEC-023 取舍 |
+| 路径大小写折叠（`test_gp_case_folding_*`） | 用例注释要求 `validate_write_path` 抛错，代码却未包 `pytest.raises`，随后直接 `target.write_text("PWNED")` | p1_4 要求同一行为（拒绝即可） | 行为已实现（抛 `PathViolationError`，AC-05 p1_4 与自测 8 参数全绿）；Gauntlet 该用例因自身结构无法同时通过，需测试方修正 |
+| 挂死调用（`test_p1_3_*`） | — | 要求 10s 内终止 | 已实现 liveness backstop，实测 **0.45s 终止**；该 repro 用例在 run 正常结束后因 `"tasks" in RunSummary` 抛 `TypeError`，属用例笔误 |
 
 ### 5. 复现命令
 

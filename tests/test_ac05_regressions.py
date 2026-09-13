@@ -173,6 +173,21 @@ def test_ac05_cancel_request_via_put_document_survives_rebuild(store: Store) -> 
     assert store.get_document("P1", "cancel_request") == {"reason": "operator pressed Ctrl-C"}
 
 
+async def test_ac05_stale_cancel_does_not_rewrite_a_finished_run(engine_factory) -> None:
+    """AC-05 F11: a cancel latched after completion must not resurrect the run."""
+    engine = engine_factory(db_name="stale.db")
+    first = await engine.run_prd("Deliver:\n- a feature", run_id="RUN-L")
+    assert first.status == "DONE"
+    before = dict(engine.store.get_document("RUN-L", "run_summary") or {})
+    # Operator pressed cancel after the run had already finished.
+    engine.store.put_document("RUN-L", "cancel_request", {"reason": "operator"})
+    resumed = await engine_factory(db_name="stale.db").resume("RUN-L")
+    after = engine.store.get_document("RUN-L", "run_summary") or {}
+    assert resumed.status == "DONE"
+    assert after.get("status") == before.get("status") == "DONE"
+    assert engine.store.get_control("RUN-L", "cancel_request") is None  # stale signal dropped
+
+
 def test_ac05_task_created_cannot_overwrite_an_existing_task(store: Store) -> None:
     """F09 (partial): a repeated creation cannot reset a task's lifecycle.
 

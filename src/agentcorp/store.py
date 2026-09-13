@@ -1244,6 +1244,11 @@ class Store:
                 (project_id, key, json.dumps(data, default=str), utcnow().isoformat()),
             )
 
+    def clear_control(self, project_id: str, key: str) -> None:
+        """Drop a latched control signal (e.g. a stale cancel request)."""
+        with self._tx() as conn:
+            conn.execute("DELETE FROM control WHERE project_id=? AND key=?", (project_id, key))
+
     def get_control(self, project_id: str, key: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(

@@ -369,6 +369,26 @@ class Engine:
         if not tasks:
             msg = f"run {project_id!r} has no tasks recorded"
             raise PermanentError(msg)
+
+        # Idempotent resume (AC-05 F11): a finished run must not be resurrected —
+        # and a cancel signal latched *after* it finished belongs to a previous
+        # process, so it is dropped instead of rewriting the terminal record.
+        finished = self.store.last_run_summary(project_id)
+        if (
+            finished is not None
+            and str(finished.get("status")) in {"DONE", "FAILED", "BUDGET_EXHAUSTED", "CANCELLED", "DEADLOCK"}
+            and all(task.is_terminal for task in tasks)
+        ):
+            self.store.clear_control(project_id, "cancel_request")
+            report = build_run_report(self.store, project_id)
+            status = str(finished["status"])
+            log.info("resume %s: already finished with status=%s; no-op", project_id, status)
+            return RunSummary(
+                run_id=project_id,
+                status=status,
+                reason="already finished; resume was a no-op",
+                report=report,
+            )
         graph = TaskGraph(tasks)
         try:
             graph.validate(strict_parents=True)
