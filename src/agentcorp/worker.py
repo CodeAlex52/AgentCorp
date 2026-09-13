@@ -25,6 +25,7 @@ from .models import Artifact, FileWrite, Task, WorkerOutcome
 from .parsing import extract_json_object, normalise_keys
 from .prompts import worker_messages
 from .runtime import AgentRuntime
+from .util import short_hash
 
 __all__ = ["Worker", "WorkerResult", "PathViolationError", "validate_write_path"]
 
@@ -189,6 +190,11 @@ class Worker:
             written.append(rel)
             artifacts.append(
                 Artifact(
+                    # Deterministic identity per (project, task, path): a rework
+                    # attempt that rewrites the same file updates one artifact
+                    # row instead of accumulating duplicates, while the event log
+                    # still records every attempt (DEC-021).
+                    id=f"ART-{short_hash([self.project_id, task.id, rel], 12)}",
                     project_id=self.project_id,
                     task_id=task.id,
                     path=rel,

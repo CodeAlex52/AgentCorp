@@ -88,11 +88,35 @@ class BudgetManager:
         #: ceiling (FIND-006).
         self.tasks_started = tasks_started
         self._seen_tasks: set[str] = set()
+        #: Tokens promised to calls that are in flight but have not settled yet.
+        #: Admission control must see them or concurrent calls overshoot (C7).
+        self._reserved_tokens = 0
         self._warned = False
 
     # ------------------------------------------------------------------- clock
     def elapsed_seconds(self) -> float:
         return max(self.clock.monotonic() - self.started_monotonic, 0.0)
+
+    # --------------------------------------------------------------- reservation
+    def reserve(self, estimated_tokens: int) -> int:
+        """Reserve tokens for an admitted call; returns the reservation id/amount.
+
+        The reservation is released by :meth:`release` when the call settles
+        (success or failure), at which point the *actual* usage is booked by
+        :meth:`record`.  Reservations make the token ceiling a hard stop under
+        concurrency: two calls can no longer both pass a check that only sees
+        already-booked usage.
+        """
+        amount = max(int(estimated_tokens), 0)
+        self._reserved_tokens += amount
+        return amount
+
+    def release(self, reservation: int) -> None:
+        self._reserved_tokens = max(self._reserved_tokens - max(int(reservation), 0), 0)
+
+    @property
+    def reserved_tokens(self) -> int:
+        return self._reserved_tokens
 
     def note_task_started(self, count: int = 1, *, task_id: str | None = None) -> None:
         """Count a dispatch.  Idempotent per task id when one is supplied."""
@@ -163,6 +187,7 @@ class BudgetManager:
         self.refusals.clear()
         self._warned = False
         self._seen_tasks.clear()
+        self._reserved_tokens = 0
 
     def status(
         self,
@@ -224,10 +249,12 @@ class BudgetManager:
                 "max_tasks",
             )
         if lim.max_tokens is not None and (
-            used_tokens >= lim.max_tokens or used_tokens + estimated_tokens > lim.max_tokens
+            used_tokens >= lim.max_tokens
+            or used_tokens + self._reserved_tokens + estimated_tokens > lim.max_tokens
         ):
             return refuse(
-                f"project token ceiling: used {used_tokens} + est {estimated_tokens} > {lim.max_tokens}",
+                f"project token ceiling: used {used_tokens} + reserved {self._reserved_tokens}"
+                f" + est {estimated_tokens} > {lim.max_tokens}",
                 "max_tokens",
             )
         if lim.max_cost_usd is not None and used_cost >= lim.max_cost_usd:
@@ -285,7 +312,13 @@ class BudgetManager:
     def remaining_tokens(self, estimated: int = 0) -> int | None:
         if self.limits.max_tokens is None:
             return None
-        return max(self.limits.max_tokens - self.project.usage.total_tokens - estimated, 0)
+        return max(
+            self.limits.max_tokens
+            - self.project.usage.total_tokens
+            - self._reserved_tokens
+            - estimated,
+            0,
+        )
 
     @property
     def exhausted(self) -> bool:

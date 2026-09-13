@@ -50,6 +50,11 @@ __all__ = ["Store", "DEFAULT_DB_NAME"]
 
 DEFAULT_DB_NAME = "agentcorp.db"
 
+#: Document keys that are *inputs* rather than derived state.  They are routed to
+#: the ``control`` table so a projection rebuild cannot delete a pending
+#: cancellation (AC-05 F07).
+CONTROL_DOCUMENT_KEYS: frozenset[str] = frozenset({"cancel_request"})
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     seq            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -730,7 +735,25 @@ class Store:
         self._put_document(conn, event.project_id, "repo_context", ctx.model_dump(mode="json"), event.created_at)
 
     def _proj_task_created(self, conn: sqlite3.Connection, event: Event) -> None:
+        """Create a task exactly once; the id can never be overwritten (DEC-023).
+
+        Two of the three AC-05 F09 complaints are enforced here: a repeated
+        `TASK_CREATED` for an existing id is refused instead of silently
+        resetting that task's lifecycle.  The birth *status* is deliberately not
+        restricted: seeding a task in a given status is a legitimate fixture and
+        repair operation (`Event` is the trusted, append-only log), while all
+        *transitions* stay whitelisted.
+
+        Trade-off: a hand-written DONE-born task bypasses the lifecycle table by
+        construction.  The engine never does this (planner and decomposer create
+        PENDING tasks), and the alternative — rejecting non-PENDING births —
+        breaks the accepted G-A fixture contract.
+        """
         task = Task.model_validate(event.payload["task"])
+        existing = conn.execute("SELECT data FROM tasks WHERE id=?", (task.id,)).fetchone()
+        if existing is not None:
+            msg = f"task {task.id!r} already exists; use TASK_UPDATED to change it"
+            raise StateError(msg)
         self._upsert_task(conn, task, event.project_id)
 
     def _proj_task_updated(self, conn: sqlite3.Connection, event: Event) -> None:
@@ -1183,8 +1206,13 @@ class Store:
         """Write a document that is *not* event-derived (e.g. cancel requests).
 
         Anything that is part of the delivery story should be an event; anything
-        that can be recomputed belongs in :meth:`put_derived`.
+        that can be recomputed belongs in :meth:`put_derived`.  Control signals
+        (a pending cancel) are routed to the ``control`` table so they survive
+        projection rebuilds.
         """
+        if key in CONTROL_DOCUMENT_KEYS:
+            self.put_control(project_id, key, data)
+            return
         with self._tx() as conn:
             self._put_document(conn, project_id, key, data, utcnow())
 
@@ -1225,6 +1253,8 @@ class Store:
         return json.loads(row["data"]) if row else None
 
     def get_document(self, project_id: str, key: str) -> dict[str, Any] | None:
+        if key in CONTROL_DOCUMENT_KEYS:
+            return self.get_control(project_id, key)
         with self._lock:
             row = self._conn.execute(
                 "SELECT data FROM documents WHERE project_id=? AND key=?", (project_id, key)

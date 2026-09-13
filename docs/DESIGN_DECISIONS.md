@@ -185,3 +185,127 @@ to finish, then cancels the remainder (`TASK_CANCELLED`) and finishes the run as
 **Trade-off.** Cancellation latency is one tick (< `tick_interval_s` + grace) rather
 than immediate; it works across processes and does not require signal plumbing into
 worker tasks.
+
+---
+
+## DEC-013 — Recovery is semantic, not lease-bound
+
+`resume` treats every interrupted `RUNNING`/`REVIEW` task as recoverable by
+default (`--force-requeue`), because the *definition* of resume is that the
+previous process is gone.  The lease remains the mechanism for the *live* system:
+`Store.recover_task()` refuses a task whose lease is still valid unless the caller
+explicitly forces it, so a watchdog or a concurrent process cannot double-execute
+live work.  The scheduler also sweeps orphaned claims (no in-flight coroutine in
+this process) before deadlock detection, which is what prevents "fresh process +
+no in-flight work" from being misread as a deadlock.
+
+**Trade-off.** A second engine process really running the same run would be
+double-dispatched by a forced resume.  Accepted for v0 (one engine process per
+run); the DB is not a coordination service.
+
+## DEC-014 — `max_tasks` is fail-closed
+
+`BudgetManager` derives `tasks_started` from `record(task_id=...)` and treats any
+`task_id` that has not consumed a slot as a new dispatch when evaluating
+`max_tasks`.  Calling `check()` without a `task_id` therefore applies the worst
+case (a new dispatch) instead of skipping the ceiling.  The engine additionally
+defaults `max_tasks` to `max_total_tasks` when the operator configured none, so a
+misconfigured run degrades to "bounded at the decomposition limit", never to
+"unbounded".
+
+## DEC-015 — Per-run contiguous sequence numbers
+
+`events.seq` (the AUTOINCREMENT primary key) is a *global* counter and has gaps
+within any single run when runs share a database file.  `Event.seq` is therefore
+the per-project `run_seq` (computed inside the same transaction), so each run's
+stream is dense `1..N`: consumers that scan seq ranges (replay, resume, gap
+detection) never mistake another run's events for lost ones.  A migration backfills
+`run_seq` for pre-existing dev databases.
+
+## DEC-016 — Poison is "cannot ever complete", not "is currently failed"
+
+`models.can_never_complete()` defines poison as `QUARANTINED`, `CANCELLED`, or
+`FAILED` with the attempt budget exhausted.  A retryable `FAILED` (including the
+backoff window between `TASK_FAILED` and `TASK_RETRIED`) must not cancel its
+dependents; otherwise the run's outcome would depend on whether a backoff delay was
+configured.
+
+## DEC-017 — Cancel is a durable control record; documents stay projections
+
+Cancellation lives in the `control` table (`put_control`/`get_control`), which is
+never rebuilt from the log because it is an *input*, not derived state.  The
+`documents` table remains strictly event-projected, which keeps `verify_replay`
+meaningful; recomputable artefacts (run reports, exports) live in `derived`.  A
+cancel requested before a run starts is remembered by the engine and applied at
+start, so "cancel early" is not lost.
+
+## DEC-018 — Write safety is alias-aware
+
+Path validation rejects escapes and VCS metadata after resolving the real path
+(case-folded, NFC-normalised, so `.GIT/config` is refused on case-insensitive
+filesystems).  Hard links are *not* rejected outright — an in-root hard link is a
+legitimate repository state — instead the writer breaks the link (unlink + create)
+so the task's change lands on a fresh inode and the aliased file elsewhere keeps
+its content.  Append mode is preserved on a private copy.
+
+**Residual risk.** TOCTOU between validation and write is not defended against
+(a hostile local writer could swap a parent directory for a symlink in the
+window); the threat model is a hostile *repository*, not a hostile local process.
+
+## DEC-019 — Billing recovery from transport error text
+
+A provider that was paid for before failing must be billed.  The runtime reads, in
+order: structured `exc.usage`, `exc.tokens`, a `billed <N> tokens` report in the
+exception message, then the pre-flight estimate.  The text pattern is a pragmatic
+last resort because real transports report this way; structured
+`ProviderBilledError(usage=...)` is the documented preferred path.  The failure
+direction is deliberately conservative: over-billing stops work earlier, while
+under-billing is a credential leak (C7).
+
+## DEC-020 — Liveness backstop independent of the supervisor's intervention budget
+
+Supervisor interventions are capped per task (`max_interventions_per_task`,
+cooldowns) so a flapping task cannot be intervened forever; that cap must not
+become a way to hang the run.  `Supervisor.stuck_task_ids()` reports
+no-progress tasks regardless of the cap, and the scheduler aborts them, letting
+the attempt budget decide between retry and quarantine.  A provider that never
+returns can therefore never leave a run waiting indefinitely.
+
+## DEC-021 — The corpus→review→rework loop reuses artifact identities
+
+Artifact ids are deterministic per `(project, task, path)`, so rework updates one
+row instead of accumulating duplicates per attempt, while the event log still
+records every `ARTIFACT_PRODUCED` (audit history).  `files_changed` in the report
+is the number of distinct paths, not the number of attempts.
+
+## DEC-022 — Admission control covers the completion, and reservations are explicit
+
+The token ceiling is enforced *before* dispatch, but a provider that was admitted
+on the prompt estimate can produce a completion that pushes the ledger past the
+ceiling.  Two mechanisms close that hole:
+
+* the runtime admits a call against `estimate(prompt) + output_allowance` where
+  the allowance is the declared `max_tokens` or (absent one) the prompt estimate
+  — i.e. "the completion is assumed to be no larger than the prompt";
+* `BudgetManager.reserve()`/`release()` hold the admission estimate while the
+  call is in flight, so concurrent calls cannot each pass a check that only sees
+  settled usage.
+
+**Trade-off.** A provider whose completion is much larger than its prompt can
+still overshoot once (the ceiling is a ceiling on *admitted* work).  Making it a
+hard physical cap would require passing `max_tokens=remaining` to every provider
+and trusting them to honour it; that is the documented next step for C7.
+
+## DEC-023 — `TASK_CREATED` cannot overwrite, but may seed any non-lifecycle state
+
+A repeated `TASK_CREATED` for an existing id raises `StateError` instead of
+silently resetting that task (AC-05 F09, the "terminal task overwritten" half).
+The birth *status* is deliberately unrestricted, because the accepted G-A
+acceptance fixtures seed tasks with `TASK_CREATED` in the status under test, and
+the event log is the trusted, append-only source of truth: *transitions* are
+whitelisted, not the arbitrary facts an operator/repair tool may write.
+
+**Trade-off.** A hand-written DONE-born task bypasses the lifecycle table.  The
+engine never produces one (planner and decomposer create PENDING tasks), and
+rejecting non-PENDING births conflicts with the G-A fixture contract, so this is
+a documented boundary rather than a silent hole.

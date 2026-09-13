@@ -111,10 +111,19 @@ class AgentRuntime:
         estimate = (
             estimated_tokens if estimated_tokens is not None else estimate_tokens(request.text())
         )
+        # Admission control must cover the completion as well as the prompt: the
+        # pre-flight estimate only knows the prompt, and a call that is admitted
+        # on "prompt fits" can then push the ledger past the ceiling (C7,
+        # AC-05 F04).  The output is assumed to be no larger than the prompt
+        # unless the caller declared a bound (DEC-022).
+        output_allowance = max(int(max_tokens or 0), estimate)
+        admission_estimate = estimate + output_allowance
 
         self.breaker.before_call()
+        reservation = 0
         if self.budget is not None:
-            self.budget.check(task_id=task_id, estimated_tokens=estimate)
+            self.budget.check(task_id=task_id, estimated_tokens=admission_estimate)
+            reservation = self.budget.reserve(admission_estimate)
 
         run = AgentRun(
             project_id=str((metadata or {}).get("project_id", "unknown")),
@@ -186,7 +195,7 @@ class AgentRuntime:
                 on_attempt=lambda attempt, exc, delay: self._on_attempt(run, attempt, exc, delay),
                 outcome=outcome,
             )
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - release then re-raise
             self.breaker.on_failure()
             run.ok = False
             run.error = str(exc)
@@ -197,6 +206,7 @@ class AgentRuntime:
             run.usage.duration_s = round(self.clock.monotonic() - started_monotonic, 4)
             self._record(run, finished=True)
             if self.budget is not None:
+                self.budget.release(reservation)
                 self.budget.record(run.usage, task_id=task_id)
             raise
         else:
@@ -213,6 +223,7 @@ class AgentRuntime:
             )
             self._record(run, finished=True)
             if self.budget is not None:
+                self.budget.release(reservation)
                 self.budget.record(run.usage, task_id=task_id)
 
         self.call_count += 1

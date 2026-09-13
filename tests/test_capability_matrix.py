@@ -257,7 +257,8 @@ def test_c09_negative_deadlock_is_detected_not_waited_out(store: Store) -> None:
     from agentcorp.worker import Worker
 
     create_project(store)
-    seed_tasks(store, "P1", [make_task("T1", status=TaskStatus.BLOCKED)])
+    seed_tasks(store, "P1", [make_task("T1")])
+    drive(store, "P1", "T1", EventType.TASK_READY, EventType.TASK_BLOCKED, reason="waiting on a human")
     graph = TaskGraph(store.list_tasks("P1"))
     runtime = AgentRuntime(MockProvider(), sleep=noop_sleep)
     scheduler = Scheduler(
