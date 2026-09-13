@@ -122,6 +122,7 @@ class Engine:
         self._project_id: str | None = None
         self._scheduler: Scheduler | None = None
         self._repo_context: str = ""
+        self._pending_cancel: str | None = None
         self.bounds = DecompositionBounds(
             max_depth=(
                 self.config.max_depth_override
@@ -242,11 +243,16 @@ class Engine:
 
     # ------------------------------------------------------------------ public
     def request_cancel(self, reason: str = "cancelled by operator") -> str | None:
-        """Durable cancellation (DEC-012): visible to every process on this DB."""
+        """Durable cancellation (DEC-012): visible to every process on this DB.
+
+        A cancel issued before/without a running scheduler is remembered and
+        applied as soon as the run starts, so "cancel early" is not silently
+        lost (C10).
+        """
+        self._pending_cancel = reason
         project_id = self._project_id or self._latest_project_id()
-        if project_id is None:
-            return None
-        self.store.put_control(project_id, "cancel_request", {"reason": reason})
+        if project_id is not None:
+            self.store.put_control(project_id, "cancel_request", {"reason": reason})
         if self._scheduler is not None:
             self._scheduler.request_cancel(reason)
         return project_id
@@ -507,6 +513,8 @@ class Engine:
         *,
         resumed: bool,
     ) -> RunSummary:
+        if self._pending_cancel is not None:
+            self.store.put_control(project_id, "cancel_request", {"reason": self._pending_cancel})
         supervisor = Supervisor(
             self.config.supervisor,
             clock=self.clock,
