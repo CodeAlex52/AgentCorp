@@ -119,6 +119,30 @@ class BudgetManager:
             )
 
     # ------------------------------------------------------------ enforcement
+    def reseed(
+        self,
+        *,
+        usage: Usage | None = None,
+        by_task: dict[str, Usage] | None = None,
+        started_monotonic: float | None = None,
+        tasks_started: int | None = None,
+    ) -> None:
+        """Rehydrate from the projection after a restart (C5).
+
+        A crash loop must not silently reset the budget, so ``resume`` seeds the
+        manager with the usage already recorded in the store.
+        """
+        if usage is not None:
+            self.project.usage = usage.model_copy()
+        if by_task is not None:
+            self.by_task = {k: _Ledger(v.model_copy()) for k, v in by_task.items()}
+        if started_monotonic is not None:
+            self.started_monotonic = started_monotonic
+        if tasks_started is not None:
+            self.tasks_started = tasks_started
+        self.refusals.clear()
+        self._warned = False
+
     def status(
         self,
         *,

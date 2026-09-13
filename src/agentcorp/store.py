@@ -144,6 +144,17 @@ CREATE TABLE IF NOT EXISTS documents (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (project_id, key)
 );
+
+-- Derived caches (reports, exports).  Deliberately *not* a projection: their
+-- content can always be recomputed from the log, and including them would break
+-- the "replay reproduces the projection byte-for-byte" invariant.
+CREATE TABLE IF NOT EXISTS derived (
+    project_id TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    data       TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, key)
+);
 """
 
 #: Tables wiped by rebuild.  ``events`` is deliberately not here.
@@ -317,10 +328,10 @@ class Store:
         lease_seconds: float = 300.0,
         now: datetime | None = None,
         actor: str = "scheduler",
-    ) -> Event | None:
+    ) -> list[Event] | None:
         """Atomically move a READY task to RUNNING and lease it (SPEC §5.2, C4).
 
-        Returns the ``TASK_STARTED`` event on success, ``None`` if another
+        Returns ``[TASK_CLAIMED, TASK_STARTED]`` on success, ``None`` if another
         claimer got there first.  The guard is a single
         ``UPDATE ... WHERE status='ready'`` so the winner is decided by SQLite's
         row lock, never by a read-then-write race.
@@ -350,7 +361,7 @@ class Store:
                     },
                 ),
             )
-            return self._insert_event(
+            started = self._insert_event(
                 conn,
                 Event(
                     project_id=self._project_of(conn, task_id),
@@ -361,6 +372,7 @@ class Store:
                     payload={"owner": owner, "claim_seq": claimed.seq},
                 ),
             )
+            return [claimed, started]
 
     def renew_lease(
         self,
@@ -368,19 +380,33 @@ class Store:
         *,
         lease_seconds: float = 300.0,
         now: datetime | None = None,
-    ) -> Task:
-        """Extend a RUNNING task's lease (progress heartbeat)."""
+    ) -> Event:
+        """Extend a RUNNING task's lease through a ``TASK_UPDATED`` event.
+
+        The baseline renewed leases and touched progress harness-side, which
+        silently broke replay equivalence (the projection contained writes that
+        were not derivable from the log).  Every mutation is an event (DEC-003).
+        """
         at = now or utcnow()
         with self._tx() as conn:
             task = self._load_task(conn, task_id)
             if task.status is not TaskStatus.RUNNING:
                 msg = f"cannot renew lease of task {task_id!r} in status {task.status.value!r}"
                 raise StateError(msg)
-            task.lease_expires_at = datetime.fromtimestamp(at.timestamp() + lease_seconds, tz=UTC)
-            task.progress_at = at
-            task.updated_at = at
-            self._upsert_task(conn, task, self._project_of(conn, task_id))
-        return task
+            lease_iso = datetime.fromtimestamp(
+                at.timestamp() + lease_seconds, tz=UTC
+            ).isoformat()
+            return self._insert_event(
+                conn,
+                Event(
+                    project_id=self._project_of(conn, task_id),
+                    type=EventType.TASK_UPDATED,
+                    task_id=task_id,
+                    actor="scheduler",
+                    created_at=at,
+                    payload={"patch": {"lease_expires_at": lease_iso}, "reason": "lease_renewal"},
+                ),
+            )
 
     def stale_running(self, now: datetime | None = None) -> list[Task]:
         """RUNNING tasks whose lease expired — orphans from a crash (C5).
@@ -464,14 +490,6 @@ class Store:
             )
         return True
 
-    def touch_progress(self, task_id: str, *, now: datetime | None = None) -> None:
-        """Record that a task made observable progress (supervisor input)."""
-        at = now or utcnow()
-        with self._tx() as conn:
-            task = self._load_task(conn, task_id)
-            task.progress_at = at
-            task.updated_at = at
-            self._upsert_task(conn, task, self._project_of(conn, task_id))
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> Event:
@@ -812,6 +830,11 @@ class Store:
 
     def _proj_agent_run_finished(self, conn: sqlite3.Connection, event: Event) -> None:
         run = AgentRun.model_validate(event.payload["run"])
+        if run.task_id and run.finished_at is not None:
+            task = self._load_task(conn, run.task_id)
+            if task.status is TaskStatus.RUNNING:
+                # A finished agent call is the canonical progress signal.
+                self._mutate_task(conn, run.task_id, event, progress_at=event.created_at)
         conn.execute(
             "UPDATE runs SET ok=?, error_type=?, tokens_in=?, tokens_out=?, calls=?, cost_usd=?,"
             " duration_s=?, finished_at=?, data=? WHERE id=?",
@@ -1029,13 +1052,31 @@ class Store:
         )
 
     def put_document(self, project_id: str, key: str, data: dict[str, Any]) -> None:
-        """Write a non-event's worth of data (reports, caches).
+        """Write a document that is *not* event-derived (e.g. cancel requests).
 
-        Prefer an event when the write is part of the delivery story; this is
-        for derived artefacts that can always be recomputed.
+        Anything that is part of the delivery story should be an event; anything
+        that can be recomputed belongs in :meth:`put_derived`.
         """
         with self._tx() as conn:
             self._put_document(conn, project_id, key, data, utcnow())
+
+    def put_derived(self, project_id: str, key: str, data: dict[str, Any]) -> None:
+        """Cache a recomputable artefact (run report, export) outside projections."""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO derived (project_id, key, data, updated_at) VALUES (?,?,?,?)"
+                " ON CONFLICT(project_id, key) DO UPDATE SET data=excluded.data,"
+                " updated_at=excluded.updated_at",
+                (project_id, key, json.dumps(data, default=str), utcnow().isoformat()),
+            )
+
+    def get_derived(self, project_id: str, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM derived WHERE project_id=? AND key=?",
+                (project_id, key),
+            ).fetchone()
+        return json.loads(row["data"]) if row else None
 
     def get_document(self, project_id: str, key: str) -> dict[str, Any] | None:
         with self._lock:

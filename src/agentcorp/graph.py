@@ -229,10 +229,18 @@ class TaskGraph:
         return bool(self._tasks) and all(t.status in TERMINAL_STATUSES for t in self._tasks.values())
 
     def blocked_by_failure(self) -> list[Task]:
-        """Pending tasks that can never run because an ancestor is dead."""
+        """Non-terminal tasks that can never run because an ancestor is dead.
+
+        Covers ``PENDING`` (waiting), ``READY`` (never dispatchable) and
+        ``BLOCKED`` tasks; the scheduler turns them into ``CANCELLED`` events.
+        """
         out = []
         for task in self._tasks.values():
-            if task.status is not TaskStatus.PENDING:
+            if task.status not in {
+                TaskStatus.PENDING,
+                TaskStatus.READY,
+                TaskStatus.BLOCKED,
+            }:
                 continue
             dead = [
                 d

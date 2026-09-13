@@ -61,3 +61,11 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RET", "ARG", "PTH"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer's documented API is `param: T = typer.Option(...)` in the signature.
+"src/agentcorp/cli.py" = ["B008"]
+# Test / example files legitimately abuse unused fixture arguments and locals.
+"tests/*" = ["ARG001", "ARG002", "F841", "B011"]
+"examples/*" = ["ARG001", "T201", "PTH"]
+"scripts/*" = ["T201"]

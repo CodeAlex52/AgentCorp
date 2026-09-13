@@ -133,6 +133,7 @@ def tasks_from_plan(
     id_by_key: dict[str, str] = {key: id_factory("T") for key in keys}
     tasks: list[Task] = []
     for key, item in zip(keys, specs, strict=True):
+        title = str(item.get("title") or "").strip()
         deps: list[str] = []
         for dep_key in as_list_of_str(item.get("depends_on")) or []:
             if dep_key not in id_by_key:

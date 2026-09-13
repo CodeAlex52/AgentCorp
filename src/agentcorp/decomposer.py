@@ -21,7 +21,7 @@ from typing import Any
 
 from .errors import DecompositionError, GraphError, SchemaError
 from .graph import TaskGraph
-from .models import Task, WorkerOutcome
+from .models import Task, TaskStatus, WorkerOutcome
 from .parsing import as_list_of_str, extract_json_object
 from .planner import tasks_from_plan
 from .prompts import decomposer_messages
@@ -302,7 +302,16 @@ def _validate_children(
     refusal = bounds.check(depth=parent.depth, total_tasks=total_tasks, new_children=len(children))
     if refusal is not None:
         raise DecompositionError(f"cannot split {parent.id}: {refusal}")
-    graph = TaskGraph(children)
+    # Children inherit the parent's dependencies (external to this split), so
+    # the child graph is validated with those dependencies stubbed in — the
+    # scheduler re-validates the full candidate graph before insertion anyway.
+    child_ids = {c.id for c in children}
+    stubs = [
+        Task(id=dep, title="(external dependency)", status=TaskStatus.DONE)
+        for dep in parent.dependencies
+        if dep not in child_ids
+    ]
+    graph = TaskGraph([*stubs, *children])
     graph.validate(strict_parents=False)
     for child in children:
         if child.id == parent.id:
