@@ -42,6 +42,7 @@ addopts = "-q --strict-markers"
 markers = [
     "slow: long running tests",
     "integration: end to end orchestration tests",
+    "smoke: opt-in real-provider test; needs credentials and network",
 ]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]

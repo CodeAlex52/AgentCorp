@@ -1,7 +1,7 @@
 # WS02 STATUS (2026-09-14T03:15:00+08:00)
 
 state: done
-current: v0 完工合同（SPEC §8）达成：308 个离线确定性测试全绿（4.75s）、demo 字节复现、benchmark JSON 通过 §6 校验、mypy strict/ruff 干净。Gauntlet 全量复测 1 条失败（`test_gp_case_folding_does_not_unlock_git_metadata`，用例自相矛盾）；AC-05 repro 11/13（余 2 条均为用例侧问题：`test_p1_3_*` 用例笔误、`test_p2_4_*` 与 Gauntlet G-A 夹具互斥），详见「4b. 验收套件之间的冲突」。
+current: v0 完工合同（SPEC §8）达成：310 个离线确定性测试全绿（4.8s）、demo 字节复现、benchmark JSON 通过 §6 校验、mypy strict/ruff 干净；另有 1 条 opt-in 真实 Provider smoke（默认 skip，见下）。Gauntlet 全量复测 1 条失败（`test_gp_case_folding_does_not_unlock_git_metadata`，用例自相矛盾）；AC-05 repro 11/13（余 2 条均为用例侧问题：`test_p1_3_*` 用例笔误、`test_p2_4_*` 与 Gauntlet G-A 夹具互斥），详见「4b. 验收套件之间的冲突」。
 
 progress:
 - 2026-09-14 Step 4+5 完成：`examples/end_to_end.py`（确定性 clock/id/无 sleep）→ `benchmarks/self_hosting_sim.json` 字节复现；`docs/report_schema.json`、`scripts/validate_benchmark.py`、`scripts/reproduce_all.sh`；`docs/ARCHITECTURE.md`、DEC-013…DEC-021。（commits 50ae56d、0c571da、48f72e1、7abce9f）
@@ -16,7 +16,7 @@ artifacts:
 - benchmarks/self_hosting_sim.json（schema §6 校验通过，可字节复现）
 - examples/end_to_end.py, examples/demo_repo/
 - scripts/validate_benchmark.py, scripts/reproduce_all.sh
-- tests/（308 条：test_capability_matrix.py、test_redteam_findings.py、test_ac05_regressions.py、test_chaos_engine.py 等 14 个文件）
+- tests/（310 条离线 + 1 条 opt-in smoke：test_capability_matrix.py、test_redteam_findings.py、test_ac05_regressions.py、test_chaos_engine.py、test_resume_guard.py、test_smoke_provider.py 等 16 个文件）
 
 blockers: 无（1 条 Gauntlet 用例为测试自身矛盾，见「逐条状态」FIND-011/G-P）
 
@@ -24,7 +24,7 @@ next:
 - （可选）将 `interventions.false_positive_guarded` 从结构性断言升级为运行期统计证据
 - （可选）为 budget 增加 reservation 结算（当前按 in-flight 最坏情况拒绝，见已知缺口）
 - （可选）提高 supervisor 干预在真实长任务下的收敛速度（当前依赖 liveness backstop）
-- （可选）补 provider opt-in smoke（`-m smoke`）与真实 API 路径的冒烟
+- （可选）补 provider opt-in smoke：已提供 `tests/test_smoke_provider.py`（`AGENTCORP_SMOKE_PROVIDER=openai uv run pytest -m smoke -s`）；仍需一次带真实 key 的 recorded run 回填指标
 - （可选）ASGI/Web UI（非目标，v0 明确不做）
 
 ---
@@ -107,11 +107,11 @@ AC-05 其余项（token 硬上限、挂死调用 liveness、并发 split 上界�
 ### 4. 已知缺陷（按价值排序，≤10）
 
 1. **C7 residual（budget）**：已完成 admission 预留/结算（DEC-022，AC-05 repro `test_p1_2_*` 转绿），残留风险仅剩“completion 远大于 prompt 的 provider 可能一次性小幅越界”。彻底闭合需把 `max_tokens=remaining` 传给 provider 并信任其执行。
-2. **单进程假设**：同一 run 被两个进程同时 `resume` 时，强制重派可能双跑（无 DB 级所有权租约/心跳）。v0 文档化为“一个 run 一个引擎进程”。
+2. **单进程假设（已加固）**：`resume` 全程持有 per-run 进程级独占锁（fcntl/flock，Windows 走 msvcrt；`tests/test_resume_guard.py`），第二个进程快速失败而不是强制重派双跑；锁随进程退出由内核释放，不影响崩溃恢复。跨机器/多副本部署仍需 DB 级租约+心跳，v0 不提供，部署时按"一个 run 一个引擎进程"配置。
 3. **路径 TOCTOU**：校验与写入之间存在竞态窗口（恶意本地进程可偷换目录为符号链接）；威胁模型是恶意仓库内容，不是本机多用户。
 4. **`interventions.false_positive_guarded` 为结构性断言**：字段恒为 True；supervisor 已统计 guard 命中和 `false_positives`，建议改为运行期证据。
 5. **Supervisor 干预上限耗尽后依赖 liveness backstop**：真 stuck 任务的恢复路径是“中止→按 attempts 重试/隔离”，没有更聪明的再分解策略。
-6. **真实 provider 无 opt-in smoke**：`-m smoke` 未提供；真实 API 路径仅有单元级覆盖（openai_compat 未联网验证）。
+6. **真实 provider 冒烟（harness 已就绪）**：提供 `-m smoke`（`tests/test_smoke_provider.py`，默认 skip），走与 `agentcorp run` 相同的 Engine 路径、真实 API key、临时 repo 副本，断言 DONE + 事件重放一致并打印指标；仍需一次带 key 的 recorded run（openai_compat 联网路径届时即被覆盖）。
 7. **`documents` 与 `derived`/`control` 表的边界靠约定**：写错表的实现不会报错，建议加类型化 API。
 8. **report `success_rate` 分母**：当前按“叶子任务 done / 叶子任务数”，聚合父节点不计入；语义已文档化但可能与外部直觉不同。
 9. **`Review.must_fix` 依赖 HIGH/CRITICAL issue**：模型给出 REJECT 但只有 MEDIUM issue 时由确定性检查兜底补 HIGH，仍属启发式。

@@ -8,8 +8,12 @@ prints.  The engine owns run-level events (``RUN_STARTED``/``RUN_RESUMED``/
 
 from __future__ import annotations
 
+import importlib
 import logging
-from collections.abc import Callable
+import os
+import re
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,6 +45,52 @@ __all__ = ["Engine", "AgentCorpEngine", "EngineConfig", "RunSummary"]
 log = logging.getLogger("agentcorp.engine")
 
 _DEFAULT_RUN_STATUS = "FAILED"
+
+#: POSIX advisory locks with an ``msvcrt`` fallback on Windows.
+_fcntl: Any = importlib.import_module("fcntl") if os.name == "posix" else None
+_msvcrt: Any = importlib.import_module("msvcrt") if os.name == "nt" else None
+
+
+def resume_lock_path(db_path: str | Path, run_id: str) -> Path:
+    """Path of the per-run file that serialises ``resume`` across processes."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id).strip("._-") or "run"
+    return Path(db_path).parent / "locks" / f"{safe}.resume.lock"
+
+
+@contextmanager
+def _hold_resume_lock(db_path: str | Path, run_id: str) -> Iterator[None]:
+    """Serialise ``resume`` of one run across processes (STATUS.md gap #2).
+
+    Without this, two processes could force-requeue the same RUNNING tasks and
+    then double-run them.  The lock is an OS advisory lock held for the whole
+    resume: the kernel releases it when the holder exits or is killed, so a
+    crashed resume never wedges the run and crash recovery keeps working.
+    """
+    path = resume_lock_path(db_path, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    busy = f"run {run_id!r} is already being resumed by another process (lock: {path})"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except OSError as exc:
+                raise PermanentError(busy) from exc
+        elif _msvcrt is not None:  # pragma: no cover - Windows only
+            try:
+                _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise PermanentError(busy) from exc
+        yield
+    finally:
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            elif _msvcrt is not None:  # pragma: no cover - Windows only
+                _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+        except OSError:  # pragma: no cover - release is best-effort
+            log.warning("failed to release resume lock %s", path, exc_info=True)
+        os.close(fd)
 
 
 @dataclass
@@ -358,6 +408,17 @@ class Engine:
         return await self._execute_run(project_id, graph, requirement, resumed=False)
 
     async def resume(self, run_id: str) -> RunSummary:
+        """Continue a run whose process died (C5): DONE tasks are never re-run.
+
+        The whole resume holds a per-run OS lock so a second process cannot
+        force-requeue the same tasks while this one runs them (STATUS.md gap
+        #2); the kernel drops the lock if this process dies, so crash recovery
+        itself is unaffected.
+        """
+        with _hold_resume_lock(self.store.path, run_id):
+            return await self._resume_locked(run_id)
+
+    async def _resume_locked(self, run_id: str) -> RunSummary:
         """Continue a run whose process died (C5): DONE tasks are never re-run."""
         project = self.store.resolve_project(run_id)
         if project is None:

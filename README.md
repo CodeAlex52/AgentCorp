@@ -7,8 +7,9 @@ delivery orchestrator. It is deliberately **offline-verifiable**: deterministic 
 fault-injection providers let the entire reliability test-suite run without network access
 or API keys.
 
-**Status: v0 complete against the `docs/SPEC_v0.md` contract** — 308 offline
-deterministic tests, a byte-reproducible benchmark, mypy strict + ruff clean.
+**Status: v0 complete against the `docs/SPEC_v0.md` contract** — 310 offline
+deterministic tests, a byte-reproducible benchmark, mypy strict + ruff clean,
+and an opt-in real-provider smoke (`-m smoke`).
 `STATUS.md` lists the per-capability evidence and the remaining (documented)
 gaps; `docs/ARCHITECTURE.md` explains how the pieces fit.
 
@@ -18,7 +19,7 @@ Most multi-agent demos show a happy path. AgentCorp is built around the failure 
 
 | Concern | Mechanism |
 |---|---|
-| Duplicate execution | atomic task claim in the store (exactly-once dispatch) |
+| Duplicate execution | atomic task claim in the store (exactly-once dispatch); a per-run OS lock serialises `resume` across processes |
 | Crash recovery | SIGKILL-safe `resume`: DONE tasks never re-run, stale RUNNING tasks re-leased |
 | Retry storms | exponential backoff + jitter, attempt caps, circuit breaker, poison-task quarantine |
 | Runaway cost | four-dimensional hard budget (tokens / cost / tasks / wall-clock), check-before-dispatch |
@@ -78,6 +79,9 @@ uv run agentcorp resume <run_id>          # recovers RUNNING/REVIEW work
 
 # one command for the whole contract (tests + demo + benchmark + mypy + ruff)
 ./scripts/reproduce_all.sh
+
+# opt-in smoke against a real provider (needs that provider's API key)
+AGENTCORP_SMOKE_PROVIDER=openai uv run pytest -m smoke -s
 ```
 
 ## Evidence (what makes this more than a demo)
@@ -85,6 +89,7 @@ uv run agentcorp resume <run_id>          # recovers RUNNING/REVIEW work
 | Claim | How it is proven |
 |---|---|
 | exactly-once dispatch | 64 threads race one READY task; exactly one claim wins (`tests/test_store.py`) |
+| concurrent resume guard | a second process `resume` of the same run fails fast instead of double-running it; the lock dies with its holder (`tests/test_resume_guard.py`) |
 | crash recovery | real `SIGKILL` mid-run, then `resume`; no re-run of DONE tasks, sequence continues (`tests/test_recovery_subprocess.py`) |
 | budget hard stops | four ceilings, check-before-dispatch, failed attempts billed, admission reservations (`tests/test_budget.py`, `test_ac05_regressions.py`) |
 | retry storms | exponential backoff + jitter, attempt caps, circuit breaker, quarantine (`tests/test_reliability.py`) |
@@ -100,11 +105,11 @@ uv run agentcorp resume <run_id>          # recovers RUNNING/REVIEW work
 - [x] planner / decomposer (PRD → requirements → DAG; bounded recursive split)
 - [x] scheduler / worker / reviewer / supervisor / engine facade
 - [x] CLI (`run` / `resume` / `status` / `graph` / `report` / `providers` / `cancel`)
-- [x] 308 offline tests incl. concurrency, SIGKILL recovery, budget hard-stop, chaos runs
+- [x] 310 offline tests incl. concurrency, SIGKILL recovery, budget hard-stop, chaos runs
+- [x] opt-in real-provider smoke (`AGENTCORP_SMOKE_PROVIDER=openai uv run pytest -m smoke -s`)
 - [x] self-hosting benchmark report (`benchmarks/self_hosting_sim.json`)
 - [x] reserve-based token admission (see `docs/DESIGN_DECISIONS.md` DEC-022)
 - [ ] provider output cap wired from the remaining budget (C7 residual risk)
-- [ ] optional `-m smoke` against a real provider
 
 ## Docs
 
