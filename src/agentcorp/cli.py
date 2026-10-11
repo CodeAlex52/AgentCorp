@@ -16,6 +16,7 @@ import json
 import logging
 import signal
 import sys
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,34 @@ app = typer.Typer(
     no_args_is_help=True,
     help="AgentCorp — local-first, event-sourced multi-agent delivery orchestrator.",
 )
+
+
+def _agentcorp_version() -> str:
+    """Installed distribution version; in a source checkout fall back to the in-tree value."""
+    try:
+        return importlib_metadata.version("agentcorp")
+    except importlib_metadata.PackageNotFoundError:  # pragma: no cover - source checkout
+        return "0.1.0"
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"agentcorp {_agentcorp_version()}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the version and exit.",
+    ),
+) -> None:
+    """AgentCorp — local-first, event-sourced multi-agent delivery orchestrator."""
+
 
 DEFAULT_DB = ".agentcorp/agentcorp.db"
 
