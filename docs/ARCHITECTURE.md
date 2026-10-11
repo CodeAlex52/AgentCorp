@@ -175,3 +175,43 @@ concurrency (64 threads racing for one claim), real faults (chaos provider) and 
 real `SIGKILL` + `resume` subprocess test are used where mock assertions would be
 insufficient evidence.  `docs/SPEC_v0.md` §7 lists the gates;
 `tests/test_capability_matrix.py` maps C1–C17 to positive/negative cases.
+
+## Crash recovery walkthrough (SIGKILL → resume)
+
+The headline reliability promise — "a SIGKILL mid-run never re-runs DONE work and never
+loses the ledger" — as a sequence:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as user
+    participant CLI as agentcorp CLI
+    participant E as engine
+    participant S as scheduler
+    participant K as store (events, append-only)
+    participant P as provider (mock / real)
+
+    U->>CLI: agentcorp run --project <repo> --prd ...
+    CLI->>E: EngineConfig
+    E->>S: start loop (budget ceilings armed)
+    S->>K: claim task (atomic; lease recorded)
+    S->>P: dispatch task (budget checked before the call)
+    P-->>K: task events (started, provider call, result)
+    Note over S,P: process is SIGKILLed mid-task
+    U->>CLI: agentcorp resume --run <id>
+    CLI->>E: resume same project / run
+    E->>K: acquire per-run lock (serialises resume across processes)
+    E->>K: replay events → rebuild projections
+    K-->>E: DONE tasks skipped, stale RUNNING re-leased
+    E->>S: continue loop from recovered state
+    S->>P: dispatch only unfinished work
+    S->>K: final outcome events
+    E-->>U: exit 0 (DONE) / 1 (business failure)
+```
+
+Follow-ups:
+
+- Contract gates: `docs/SPEC_v0.md` §7; the real SIGKILL test lives in
+  `tests/test_recovery_subprocess.py`.
+- Budget guarantee: check-before-dispatch re-runs on resume, so recovery cannot blow a
+  ceiling.
