@@ -1,5 +1,7 @@
 # AgentCorp — Recursive Delivery OS
 
+[![CI](https://github.com/CodeAlex52/AgentCorp/actions/workflows/ci.yml/badge.svg)](https://github.com/CodeAlex52/AgentCorp/actions/workflows/ci.yml)
+
 > `(git repo, natural-language PRD)` → **reviewed, tested delivery** + auditable event ledger + reproducible benchmark report.
 
 AgentCorp is a local-first, event-sourced, crash-recoverable, budget-bounded multi-agent
